@@ -66,6 +66,44 @@ struct
       ("write_int", Val_primitive ("write_int",
                 fn Val_number n => (print (Absyn.intToString n ^ "\n"); Val_number n)
                  | _ => raise Eval_error "write_int: an integer expected")),
+      (* ---- 文字列を分解するための組み込み ---- *)
+      ("size", Val_primitive ("size",
+                fn Val_string s => Val_number (IntInf.fromInt (String.size s))
+                 | _ => raise Eval_error "size: a string expected")),
+      ("sub", Val_primitive ("sub",          (* sub s i : i 文字目の 1 文字 *)
+                fn Val_string s => Val_primitive ("sub",
+                     fn Val_number i =>
+                          let val k = IntInf.toInt i handle Overflow => ~1
+                          in if k < 0 orelse k >= String.size s
+                             then raise Eval_error "sub: index out of range"
+                             else Val_string (String.str (String.sub (s, k)))
+                          end
+                      | _ => raise Eval_error "sub: an integer expected")
+                 | _ => raise Eval_error "sub: a string expected")),
+      ("ord", Val_primitive ("ord",          (* 先頭 1 文字の文字コード *)
+                fn Val_string s =>
+                     if String.size s = 0 then raise Eval_error "ord: empty string"
+                     else Val_number (IntInf.fromInt (Char.ord (String.sub (s, 0))))
+                 | _ => raise Eval_error "ord: a string expected")),
+      ("chr", Val_primitive ("chr",
+                fn Val_number n =>
+                     let val k = IntInf.toInt n handle Overflow => ~1
+                     in if k < 0 orelse k > 255
+                        then raise Eval_error "chr: out of range"
+                        else Val_string (String.str (Char.chr k))
+                     end
+                 | _ => raise Eval_error "chr: an integer expected")),
+      ("explode", Val_primitive ("explode",   (* 1 文字ずつの文字列のリストへ *)
+                fn Val_string s =>
+                     List.foldr (fn (c, acc) => Val_cons (Val_string (String.str c), acc))
+                                Val_nil (String.explode s)
+                 | _ => raise Eval_error "explode: a string expected")),
+      ("implode", Val_primitive ("implode",
+                fn v =>
+                  let fun go Val_nil acc = String.concat (List.rev acc)
+                        | go (Val_cons (Val_string s, t)) acc = go t (s :: acc)
+                        | go _ _ = raise Eval_error "implode: a list of strings expected"
+                  in Val_string (go v []) end)),
       ("quit", Val_primitive ("quit", fn _ => raise Util.End_of_system))
   ]
 
@@ -92,6 +130,12 @@ struct
       ("print_int", schema_trivial (type_arrow type_int type_unit)),
       ("print_newline", schema_trivial (type_arrow type_unit type_unit)),
       ("write_int", schema_trivial (type_arrow type_int type_int)),
+      ("size", schema_trivial (type_arrow type_string type_int)),
+      ("sub", schema_trivial (type_arrow type_string (type_arrow type_int type_string))),
+      ("ord", schema_trivial (type_arrow type_string type_int)),
+      ("chr", schema_trivial (type_arrow type_int type_string)),
+      ("explode", schema_trivial (type_arrow type_string (type_list type_string))),
+      ("implode", schema_trivial (type_arrow (type_list type_string) type_string)),
       ("quit", poly1 (fn a => type_arrow type_unit a))
   ]
 end

@@ -1,0 +1,187 @@
+(* ================================================================
+   lexer.mml -- MiniML で書いた MiniML の字句解析器
+   実行:  ./miniml3 lexer.mml
+
+   explode / ord / chr が入ったので、プログラムを文字列として受け取り、
+   1 文字ずつの文字列のリストに開いて走査できるようになった。
+   ここで切り出す記号は miniml.lex（ML-Lex 版）とちょうど同じ。
+
+   記号は (種別, 文字面, 数) の三つ組で表す。
+     ("num", "",   n)   整数
+     ("id",  名前, 0)   識別子
+     ("kw",  語,   0)   予約語
+     ("op",  記号, 0)   演算子・括弧・区切り
+     ("str", 中身, 0)   文字列リテラル（エスケープ処理済み）
+   ================================================================ *)
+
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec iter f l = match l with [] -> () | x :: r -> let u = f x in iter f r;
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+let rec joins sep l =
+  match l with [] -> "" | [x] -> x | x :: r -> x ^ sep ^ joins sep r;
+
+(* ---------------- 文字の分類 ----------------
+   文字は 1 文字の文字列。比較は多相なので辞書順でそのまま使える。 *)
+let isDigit c = c >= "0" && c <= "9";
+let isLower c = c >= "a" && c <= "z";
+let isUpper c = c >= "A" && c <= "Z";
+let isAlpha c = isLower c || isUpper c;
+let isIdStart c = isAlpha c || c = "_";
+let isIdChar c = isAlpha c || isDigit c || c = "_" || c = "'";
+let isSpace c = c = " " || c = "\t" || c = "\n";
+
+let isKw s =
+  s = "let" || s = "rec" || s = "in" || s = "if" || s = "then" || s = "else" ||
+  s = "fun" || s = "function" || s = "match" || s = "with" ||
+  s = "true" || s = "false" || s = "mod";
+
+(* 2 文字で 1 つになる記号 *)
+let isTwo s =
+  s = "->" || s = "::" || s = "<=" || s = ">=" || s = "<>" ||
+  s = "&&" || s = "||";
+
+(* ---------------- 走査の部品 ----------------
+   どれも (読み取った結果, 残りの文字列) を返す。 *)
+
+let rec scanNum acc cs =
+  match cs with
+    [] -> (acc, [])
+  | c :: r -> if isDigit c then scanNum (acc * 10 + (ord c - 48)) r else (acc, cs);
+
+let rec scanId acc cs =
+  match cs with
+    [] -> (acc, [])
+  | c :: r -> if isIdChar c then scanId (acc ^ c) r else (acc, cs);
+
+(* コメント開始記号を読んだあとから呼ぶ。入れ子を数える。 *)
+let rec skipComment d cs =
+  if d = 0 then cs
+  else
+    match cs with
+      [] -> []
+    | a :: r ->
+        (match r with
+           [] -> []
+         | b :: r2 ->
+             if a = "(" && b = "*" then skipComment (d + 1) r2
+             else if a = "*" && b = ")" then skipComment (d - 1) r2
+             else skipComment d r);
+
+(* 開き引用符を読んだあとから呼ぶ。 *)
+let rec scanStr acc cs =
+  match cs with
+    [] -> (acc, [])
+  | c :: r ->
+      if c = "\"" then (acc, r)
+      else if c = "\\" then
+        (match r with
+           [] -> (acc, [])
+         | e :: r2 ->
+             if e = "n" then scanStr (acc ^ "\n") r2
+             else if e = "t" then scanStr (acc ^ "\t") r2
+             else scanStr (acc ^ e) r2)
+      else scanStr (acc ^ c) r;
+
+(* ---------------- 本体 ---------------- *)
+let rec lex cs =
+  match cs with
+    [] -> []
+  | c :: r ->
+      if isSpace c then lex r
+      else if isDigit c then
+        (let p = scanNum 0 cs in ("num", "", fst p) :: lex (snd p))
+      else if isIdStart c then
+        (let p = scanId "" cs in
+         let s = fst p in
+         (if s = "_" then ("op", "_", 0)
+          else if isKw s then ("kw", s, 0)
+          else ("id", s, 0)) :: lex (snd p))
+      else if c = "\"" then
+        (let p = scanStr "" r in ("str", fst p, 0) :: lex (snd p))
+      else
+        (match r with
+           [] -> [("op", c, 0)]
+         | d :: r2 ->
+             if c = "(" && d = "*" then lex (skipComment 1 r2)
+             else if isTwo (c ^ d) then ("op", c ^ d, 0) :: lex r2
+             else ("op", c, 0) :: lex r);
+
+let tokens src = lex (explode src);
+
+(* ---------------- 表示 ---------------- *)
+let showTok t =
+  let k = fst t in
+  let s = fst (snd t) in
+  if k = "num" then "num " ^ string_of_int (snd (snd t))
+  else if k = "str" then "str \"" ^ s ^ "\""
+  else k ^ " " ^ s;
+
+let showToks ts = joins " | " (map showTok ts);
+
+(* 記号列から原文を組み立て直す。空白で繋ぐだけの素朴なもの。 *)
+let unTok t =
+  let k = fst t in
+  let s = fst (snd t) in
+  if k = "num" then string_of_int (snd (snd t))
+  else if k = "str" then "\"" ^ s ^ "\""
+  else s;
+let unlex ts = joins " " (map unTok ts);
+
+(* ================================================================
+   実行
+   ================================================================ *)
+let check s b = print_string ("  " ^ (if b then "OK  " else "NG  ") ^ s ^ "\n");
+let demo src =
+  (let u = print_string ("  原文 : " ^ src ^ "\n") in
+   print_string ("  記号 : " ^ showToks (tokens src) ^ "\n\n"));
+
+print_string "-- MiniML の原文を字句解析する --\n";
+iter demo
+  [ "let rec fac n = if n = 0 then 1 else n * fac (n-1);";
+    "match l with [] -> 0 | x :: r -> 1 + f r;";
+    "a <= b && c <> d || e >= f;";
+    "let s = \"hi\\nthere\" ^ \"!\" in size s;";
+    "(* 入れ子の (* コメント *) は飛ばす *) 42 mod 5;";
+    "fun x y -> [x; y; 1000000000000000000000];" ];
+
+print_string "-- 期待する記号列と一致するか --\n";
+check "fac の定義"
+  (tokens "let rec fac n = if n = 0 then 1 else n * fac (n-1);"
+   = [ ("kw","let",0); ("kw","rec",0); ("id","fac",0); ("id","n",0); ("op","=",0);
+       ("kw","if",0); ("id","n",0); ("op","=",0); ("num","",0);
+       ("kw","then",0); ("num","",1);
+       ("kw","else",0); ("id","n",0); ("op","*",0); ("id","fac",0);
+       ("op","(",0); ("id","n",0); ("op","-",0); ("num","",1); ("op",")",0);
+       ("op",";",0) ]);
+check "2 文字記号"
+  (tokens "-> :: <= >= <> && || - : < > & |"
+   = [ ("op","->",0); ("op","::",0); ("op","<=",0); ("op",">=",0); ("op","<>",0);
+       ("op","&&",0); ("op","||",0);
+       ("op","-",0); ("op",":",0); ("op","<",0); ("op",">",0);
+       ("op","&",0); ("op","|",0) ]);
+check "ワイルドカードと _ で始まる識別子"
+  (tokens "_ _x x_ x'" = [ ("op","_",0); ("id","_x",0); ("id","x_",0); ("id","x'",0) ]);
+check "多倍長の整数リテラル"
+  (tokens "123456789012345678901234567890"
+   = [ ("num","",123456789012345678901234567890) ]);
+check "入れ子コメントを飛ばす"
+  (tokens "(* a (* b *) c *) 1 + 2" = tokens "1 + 2");
+check "文字列のエスケープ"
+  (tokens "\"a\\nb\\tc\\\"d\"" = [ ("str", "a\nb\tc\"d", 0) ]);
+check "空白の置き方によらない"
+  (tokens "let  f x=x+1;" = tokens "let f x = x + 1 ;");
+
+print_string "-- 原文へ戻して再び字句解析しても同じか（往復） --\n";
+let roundtrip src = tokens (unlex (tokens src)) = tokens src;
+iter (fun s -> check s (roundtrip s))
+  [ "let rec fac n = if n = 0 then 1 else n * fac (n-1);";
+    "match l with [] -> 0 | x :: r -> 1 + f r;";
+    "a <= b && c <> d || e >= f;";
+    "fun x y -> [x; y; 1000000000000000000000];";
+    "let s = \"hi\\nthere\" ^ \"!\" in size s;" ];
+
+print_string "-- 記号の個数 --\n";
+map (fun s -> length (tokens s))
+  [ "let rec fac n = if n = 0 then 1 else n * fac (n-1);";
+    "match l with [] -> 0 | x :: r -> 1 + f r;";
+    "a <= b && c <> d || e >= f;" ];

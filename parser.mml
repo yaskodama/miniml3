@@ -1,0 +1,392 @@
+(* ================================================================
+   parser.mml -- MiniML で書いた MiniML の構文解析器
+                 字句解析器と評価器も繋いで、原文から値まで通す。
+   実行:  ./miniml3 parser.mml
+
+     原文（文字列）
+       --[ lex ]-->     記号列   (種別, 文字面, 数) のリスト
+       --[ parse ]-->   前置記法 (種別, 名前, 数) のリスト
+       --[ ev ]-->      値
+
+   構文は miniml.grm と同じ結合・優先順位。ただし評価器が一階なので、
+   受理するのは meta.mml の対象言語（数・変数・算術・比較・論理・
+   単項マイナス・if・let・関数呼び出し）に限る。
+
+   相互再帰が書けないので、式の各段は「最上位の式解析器 pE」を引数で
+   受け取り、下へ渡していく。pExpr だけが自分自身を pE として渡す。
+   ================================================================ *)
+
+let rec append a b = match a with [] -> b | x :: r -> x :: append r b;
+let rec concatl ll = match ll with [] -> [] | l :: r -> append l (concatl r);
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec iter f l = match l with [] -> () | x :: r -> let u = f x in iter f r;
+let rec joins sep l =
+  match l with [] -> "" | [x] -> x | x :: r -> x ^ sep ^ joins sep r;
+
+(* ================================================================
+   1. 字句解析器（lexer.mml と同じもの）
+   ================================================================ *)
+let isDigit c = c >= "0" && c <= "9";
+let isAlpha c = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
+let isIdStart c = isAlpha c || c = "_";
+let isIdChar c = isAlpha c || isDigit c || c = "_" || c = "'";
+let isSpace c = c = " " || c = "\t" || c = "\n";
+let isKwS s =
+  s = "let" || s = "rec" || s = "in" || s = "if" || s = "then" || s = "else" ||
+  s = "fun" || s = "function" || s = "match" || s = "with" ||
+  s = "true" || s = "false" || s = "mod";
+let isTwo s =
+  s = "->" || s = "::" || s = "<=" || s = ">=" || s = "<>" || s = "&&" || s = "||";
+
+let rec scanNum acc cs =
+  match cs with [] -> (acc, [])
+  | c :: r -> if isDigit c then scanNum (acc * 10 + (ord c - 48)) r else (acc, cs);
+let rec scanId acc cs =
+  match cs with [] -> (acc, [])
+  | c :: r -> if isIdChar c then scanId (acc ^ c) r else (acc, cs);
+let rec skipComment d cs =
+  if d = 0 then cs
+  else match cs with [] -> []
+       | a :: r -> (match r with [] -> []
+                    | b :: r2 -> if a = "(" && b = "*" then skipComment (d + 1) r2
+                                 else if a = "*" && b = ")" then skipComment (d - 1) r2
+                                 else skipComment d r);
+let rec scanStr acc cs =
+  match cs with [] -> (acc, [])
+  | c :: r -> if c = "\"" then (acc, r)
+              else if c = "\\" then
+                (match r with [] -> (acc, [])
+                 | e :: r2 -> if e = "n" then scanStr (acc ^ "\n") r2
+                              else if e = "t" then scanStr (acc ^ "\t") r2
+                              else scanStr (acc ^ e) r2)
+              else scanStr (acc ^ c) r;
+
+let rec lex cs =
+  match cs with [] -> []
+  | c :: r ->
+      if isSpace c then lex r
+      else if isDigit c then (let p = scanNum 0 cs in ("num", "", fst p) :: lex (snd p))
+      else if isIdStart c then
+        (let p = scanId "" cs in let s = fst p in
+         (if s = "_" then ("op", "_", 0)
+          else if isKwS s then ("kw", s, 0) else ("id", s, 0)) :: lex (snd p))
+      else if c = "\"" then (let p = scanStr "" r in ("str", fst p, 0) :: lex (snd p))
+      else (match r with [] -> [("op", c, 0)]
+            | d :: r2 -> if c = "(" && d = "*" then lex (skipComment 1 r2)
+                         else if isTwo (c ^ d) then ("op", c ^ d, 0) :: lex r2
+                         else ("op", c, 0) :: lex r);
+let tokens src = lex (explode src);
+
+(* ================================================================
+   2. 構文解析器
+   ================================================================ *)
+let kind t = fst t;
+let text t = fst (snd t);
+let numv t = snd (snd t);
+let isOpT t s = kind t = "op" && text t = s;
+let isKwT t s = kind t = "kw" && text t = s;
+let headIsOp ts s = match ts with [] -> false | t :: _ -> isOpT t s;
+let headIsKw ts s = match ts with [] -> false | t :: _ -> isKwT t s;
+let eatOp ts s = match ts with [] -> [] | t :: r -> if isOpT t s then r else ts;
+let eatKw ts s = match ts with [] -> [] | t :: r -> if isKwT t s then r else ts;
+
+(* 引数になれる、それ以上広がらない式 *)
+let startsPrim ts =
+  match ts with [] -> false
+  | t :: _ -> kind t = "num" || kind t = "id" || isOpT t "(" 
+              || isKwT t "true" || isKwT t "false";
+
+let pPrim pE ts =
+  match ts with [] -> ([], [])
+  | t :: r ->
+      if kind t = "num" then ([("n", "", numv t)], r)
+      else if kind t = "id" then ([("v", text t, 0)], r)
+      else if isKwT t "true" then ([("n", "", 1)], r)
+      else if isKwT t "false" then ([("n", "", 0)], r)
+      else if isOpT t "(" then (let e = pE r in (fst e, eatOp (snd e) ")"))
+      else ([], ts);
+
+(* 関数適用の引数を貪欲に集める *)
+let rec pArgs pE acc ts =
+  if startsPrim ts then (let a = pPrim pE ts in pArgs pE (append acc [fst a]) (snd a))
+  else (acc, ts);
+
+let pApp pE ts =
+  match ts with [] -> ([], [])
+  | t :: r ->
+      if kind t = "id" then
+        (let a = pArgs pE [] r in
+         let k = length (fst a) in
+         if k = 0 then ([("v", text t, 0)], snd a)
+         else (("call", text t, k) :: concatl (fst a), snd a))
+      else pPrim pE ts;
+
+let rec pUnary pE ts =
+  match ts with [] -> ([], [])
+  | t :: r -> if isOpT t "-" then (let a = pUnary pE r in (("~", "", 0) :: fst a, snd a))
+              else pApp pE ts;
+
+(* 左結合の二項演算をまわす共通形。sel は記号から演算子名を選ぶ。 *)
+let rec pLoop sub sel pE lhs ts =
+  match ts with [] -> (lhs, [])
+  | t :: r ->
+      let g = sel t in
+      if g = "" then (lhs, ts)
+      else (let a = sub pE r in
+            pLoop sub sel pE ((g, "", 0) :: append lhs (fst a)) (snd a));
+let pBin sub sel pE ts = let a = sub pE ts in pLoop sub sel pE (fst a) (snd a);
+
+let selMul t = if isOpT t "*" then "*" else if isOpT t "/" then "/"
+               else if isKwT t "mod" then "%" else "";
+let selAdd t = if isOpT t "+" then "+" else if isOpT t "-" then "-" else "";
+let selCmp t = if isOpT t "=" then "=" else if isOpT t "<>" then "#"
+               else if isOpT t "<=" then "<=" else if isOpT t ">=" then ">="
+               else if isOpT t "<" then "<" else if isOpT t ">" then ">" else "";
+let selAnd t = if isOpT t "&&" then "&" else "";
+let selOr  t = if isOpT t "||" then "|" else "";
+
+let pMul pE ts = pBin pUnary selMul pE ts;
+let pAdd pE ts = pBin pMul selAdd pE ts;
+let pCmp pE ts = pBin pAdd selCmp pE ts;
+let pAnd pE ts = pBin pCmp selAnd pE ts;
+let pOr  pE ts = pBin pAnd selOr  pE ts;
+
+let rec pExpr ts =
+  match ts with [] -> ([], [])
+  | t :: r ->
+      if isKwT t "if" then
+        (let c = pExpr r in
+         let a = pExpr (eatKw (snd c) "then") in
+         let b = pExpr (eatKw (snd a) "else") in
+         (("if", "", 0) :: append (fst c) (append (fst a) (fst b)), snd b))
+      else if isKwT t "let" then
+        (match r with [] -> ([], [])
+         | v :: r1 ->
+             let a = pExpr (eatOp r1 "=") in
+             let b = pExpr (eatKw (snd a) "in") in
+             (("let", text v, 0) :: append (fst a) (fst b), snd b))
+      else pOr pExpr ts;
+
+(* let rec f x y = expr ;  の並びと、最後の主式 *)
+let rec pParams acc ts =
+  match ts with [] -> (acc, [])
+  | t :: r -> if kind t = "id" then pParams (append acc [text t]) r else (acc, ts);
+
+let pDef ts =
+  match ts with
+    _ :: _ :: nm :: r ->
+      (let ps = pParams [] r in
+       let e = pExpr (eatOp (snd ps) "=") in
+       ((text nm, (fst ps, fst e)), eatOp (snd e) ";"))
+  | _ -> (("", ([], [])), ts);
+
+let rec pDefs acc ts =
+  if headIsKw ts "let" && headIsKw (eatKw ts "let") "rec"
+  then (let d = pDef ts in pDefs (append acc [fst d]) (snd d))
+  else (acc, ts);
+
+let parseProgram src =
+  let ts = tokens src in
+  let d = pDefs [] ts in
+  let m = pExpr (snd d) in
+  (fst d, fst m);
+
+(* ================================================================
+   3. 評価器（meta.mml と同じもの）
+   ================================================================ *)
+let tagOf t = fst t;
+let namOf t = fst (snd t);
+let numOf t = snd (snd t);
+
+let arity t =
+  let g = tagOf t in
+  if g = "n" || g = "v" then 0
+  else if g = "~" then 1
+  else if g = "let" then 2
+  else if g = "if" then 3
+  else if g = "call" then numOf t
+  else 2;
+let rec skipn k code =
+  if k = 0 then code
+  else match code with [] -> [] | t :: r -> skipn (k - 1 + arity t) r;
+let skip1 code = skipn 1 code;
+let rec look x env =
+  match env with [] -> 0 | p :: r -> if fst p = x then snd p else look x r;
+let rec findf f defs =
+  match defs with [] -> ([], []) | d :: r -> if fst d = f then snd d else findf f r;
+let rec bind pv env =
+  match pv with ([], _) -> env | (_, []) -> env
+  | (p :: pr, v :: vr) -> (p, v) :: bind (pr, vr) env;
+let binop g a b =
+  if g = "+" then a + b else if g = "-" then a - b
+  else if g = "*" then a * b else if g = "/" then a / b
+  else if g = "%" then a mod b
+  else if g = "<" then (if a < b then 1 else 0)
+  else if g = ">" then (if a > b then 1 else 0)
+  else if g = "<=" then (if a <= b then 1 else 0)
+  else if g = ">=" then (if a >= b then 1 else 0)
+  else if g = "=" then (if a = b then 1 else 0)
+  else if g = "#" then (if a <> b then 1 else 0)
+  else if g = "&" then (if a <> 0 && b <> 0 then 1 else 0)
+  else if g = "|" then (if a <> 0 || b <> 0 then 1 else 0)
+  else 0;
+let rec evargs evf k code env defs =
+  if k = 0 then ([], code)
+  else let p = evf code env defs in
+       let q = evargs evf (k - 1) (snd p) env defs in
+       (fst p :: fst q, snd q);
+let rec ev code env defs =
+  match code with [] -> (0, [])
+  | t :: r ->
+      let g = tagOf t in
+      if g = "n" then (numOf t, r)
+      else if g = "v" then (look (namOf t) env, r)
+      else if g = "~" then (let a = ev r env defs in (0 - fst a, snd a))
+      else if g = "if" then
+        (let c = ev r env defs in
+         if fst c <> 0
+         then (let a = ev (snd c) env defs in (fst a, skip1 (snd a)))
+         else (let a = ev (skip1 (snd c)) env defs in (fst a, snd a)))
+      else if g = "let" then
+        (let a = ev r env defs in
+         let b = ev (snd a) ((namOf t, fst a) :: env) defs in (fst b, snd b))
+      else if g = "call" then
+        (let ps = evargs ev (numOf t) r env defs in
+         let fd = findf (namOf t) defs in
+         let b = ev (snd fd) (bind (fst fd, fst ps) []) defs in
+         (fst b, snd ps))
+      else (let a = ev r env defs in
+            let b = ev (snd a) env defs in
+            (binop g (fst a) (fst b), snd b));
+
+(* ================================================================
+   4. 前置記法を読める式に戻す表示器
+   ================================================================ *)
+let rec unpargs unpf k code =
+  if k = 0 then ("", code)
+  else let p = unpf code in
+       let q = unpargs unpf (k - 1) (snd p) in
+       (" " ^ fst p ^ fst q, snd q);
+let rec unp code =
+  match code with [] -> ("", [])
+  | t :: r ->
+      let g = tagOf t in
+      if g = "n" then (string_of_int (numOf t), r)
+      else if g = "v" then (namOf t, r)
+      else if g = "~" then (let a = unp r in ("(-" ^ fst a ^ ")", snd a))
+      else if g = "if" then
+        (let c = unp r in let a = unp (snd c) in let b = unp (snd a) in
+         ("(if " ^ fst c ^ " then " ^ fst a ^ " else " ^ fst b ^ ")", snd b))
+      else if g = "let" then
+        (let a = unp r in let b = unp (snd a) in
+         ("(let " ^ namOf t ^ " = " ^ fst a ^ " in " ^ fst b ^ ")", snd b))
+      else if g = "call" then
+        (let a = unpargs unp (numOf t) r in ("(" ^ namOf t ^ fst a ^ ")", snd a))
+      else (let a = unp r in let b = unp (snd a) in
+            ("(" ^ fst a ^ " " ^ (if g = "%" then "mod" else if g = "#" then "<>"
+                                  else if g = "&" then "&&" else if g = "|" then "||"
+                                  else g) ^ " " ^ fst b ^ ")", snd b));
+let unparse code = fst (unp code);
+
+(* ================================================================
+   5. 原文から値まで
+   ================================================================ *)
+let evalSrc src = let p = parseProgram src in fst (ev (snd p) [] (fst p));
+let parseExpr src = fst (pExpr (tokens src));
+
+(* ================================================================
+   実行
+   ================================================================ *)
+let check s b = print_string ("  " ^ (if b then "OK  " else "NG  ") ^ s ^ "\n");
+let showRun src =
+  print_string ("  " ^ src ^ "\n      ==> " ^ string_of_int (evalSrc src) ^ "\n");
+let showParse src =
+  print_string ("  原文   : " ^ src ^ "\n  前置形 : "
+                ^ unparse (parseExpr src) ^ "\n\n");
+
+print_string "-- 式を解析して、前置記法から読める形に戻す --\n";
+iter showParse
+  [ "1 + 2 * 3";
+    "(1 + 2) * 3";
+    "a - b - c";
+    "n * fac (n-1)";
+    "if n = 0 then 1 else n * fac (n-1)";
+    "let x = 6 in let y = 7 in x * y";
+    "a <= b && c <> d || e >= f";
+    "- x * 2";
+    "hasf n (d + 1)" ];
+
+print_string "-- 原文から値まで通す --\n";
+iter showRun
+  [ "2 + 3 * 4";
+    "(2 + 3) * 4";
+    "let x = 6 in let y = 7 in x * y";
+    "(* コメントは飛ばす *) 100 mod 7";
+    "if 3 < 4 then 111 else 222";
+    "let rec fac n = if n = 0 then 1 else n * fac (n-1); fac 20";
+    "let rec fib n = if n < 2 then n else fib (n-1) + fib (n-2); fib 25";
+    "let rec gcd a b = if b = 0 then a else gcd b (a mod b); gcd 1071 462" ];
+
+print_string "-- 多倍長のまま通る --\n";
+showRun "let rec fac n = if n = 0 then 1 else n * fac (n-1); fac 100";
+showRun "let rec pow b k = if k = 0 then 1 else b * pow b (k-1); pow 2 128";
+
+print_string "-- 複数の定義を持つプログラム --\n";
+showRun ("let rec hasf n d = if d * d > n then 0 else if n mod d = 0 then 1 else hasf n (d+1);"
+         ^ "let rec isp a = if a < 2 then 0 else 1 - hasf a 2;"
+         ^ "let rec countp a b = if a > b then 0 else isp a + countp (a+1) b;"
+         ^ "countp 1 1000");
+showRun ("let rec clen n = if n = 1 then 1"
+         ^ " else 1 + clen (if n mod 2 = 0 then n / 2 else 3 * n + 1);"
+         ^ "clen 27");
+
+print_string "-- 手で書いた前置記法と、解析結果が一致するか --\n";
+check "fac の本体"
+  (parseExpr "if n = 0 then 1 else n * fac (n-1)"
+   = [ ("if","",0); ("=","",0); ("v","n",0); ("n","",0);
+       ("n","",1);
+       ("*","",0); ("v","n",0); ("call","fac",1); ("-","",0); ("v","n",0); ("n","",1) ]);
+check "gcd の本体"
+  (parseExpr "if b = 0 then a else gcd b (a mod b)"
+   = [ ("if","",0); ("=","",0); ("v","b",0); ("n","",0);
+       ("v","a",0);
+       ("call","gcd",2); ("v","b",0); ("%","",0); ("v","a",0); ("v","b",0) ]);
+check "左結合  a - b - c  =>  ((a - b) - c)"
+  (unparse (parseExpr "a - b - c") = "((a - b) - c)");
+check "優先順位  1 + 2 * 3  =>  (1 + (2 * 3))"
+  (unparse (parseExpr "1 + 2 * 3") = "(1 + (2 * 3))");
+check "括弧      (1 + 2) * 3  =>  ((1 + 2) * 3)"
+  (unparse (parseExpr "(1 + 2) * 3") = "((1 + 2) * 3)");
+check "|| より && が強い"
+  (unparse (parseExpr "a && b || c && d") = "(((a && b)) || ((c && d)))"
+   || unparse (parseExpr "a && b || c && d") = "((a && b) || (c && d))");
+check "単項マイナスは適用より弱い"
+  (unparse (parseExpr "- fac 3") = "(-(fac 3))");
+
+print_string "-- 自己記述の処理系と、MiniML 直書きの結果を照合 --\n";
+let rec nfac n = if n = 0 then 1 else n * nfac (n - 1);
+let rec nfib n = if n < 2 then n else nfib (n - 1) + nfib (n - 2);
+let rec ngcd a b = if b = 0 then a else ngcd b (a mod b);
+let rec npow b k = if k = 0 then 1 else b * npow b (k - 1);
+let rec nclen n = if n = 1 then 1
+                  else 1 + nclen (if n mod 2 = 0 then n / 2 else 3 * n + 1);
+check "fac 100"
+  (evalSrc "let rec fac n = if n = 0 then 1 else n * fac (n-1); fac 100" = nfac 100);
+check "fib 25"
+  (evalSrc "let rec fib n = if n < 2 then n else fib (n-1) + fib (n-2); fib 25" = nfib 25);
+check "gcd 1071 462"
+  (evalSrc "let rec gcd a b = if b = 0 then a else gcd b (a mod b); gcd 1071 462"
+   = ngcd 1071 462);
+check "pow 2 128"
+  (evalSrc "let rec pow b k = if k = 0 then 1 else b * pow b (k-1); pow 2 128"
+   = npow 2 128);
+check "clen 27"
+  (evalSrc ("let rec clen n = if n = 1 then 1"
+            ^ " else 1 + clen (if n mod 2 = 0 then n / 2 else 3 * n + 1); clen 27")
+   = nclen 27);
+check "fac 0..12 の一括"
+  (map (fun k -> evalSrc ("let rec fac n = if n = 0 then 1 else n * fac (n-1); fac "
+                          ^ string_of_int k))
+       [0;1;2;3;4;5;6;7;8;9;10;11;12]
+   = map nfac [0;1;2;3;4;5;6;7;8;9;10;11;12]);
