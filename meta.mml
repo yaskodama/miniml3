@@ -1,0 +1,316 @@
+(* ================================================================
+   meta.mml -- MiniML で書いた MiniML の処理系（メタ循環評価器）
+   実行:  ./miniml3 meta.mml
+
+   ----------------------------------------------------------------
+   この言語で処理系を書くときにぶつかる壁
+   ----------------------------------------------------------------
+   (1) 文字列を分解できない。使えるのは ^ と比較だけで、size も sub も
+       explode も無い。よって「字句解析器は原理的に書けない」。
+       プログラムは文字列ではなく、記号の列として与える。
+
+   (2) 代数的データ型も再帰的な型定義も無い。よって構文木を木として
+       持てない。ここでは前置記法の平坦なリストで表す。節点は
+       (種別, 名前, 数) の三つ組で、これは再帰的でない型なので通る。
+
+   (3) 同じ理由で、値の型に閉包を入れられない
+       （value = ... | Clo of code * (string * value) list は再帰的）。
+       よって対象言語は一階に絞る。関数は大域の定義表に置く。
+
+   (4) 相互再帰が書けない。ev と evargs は互いを呼ぶので、
+       evargs は ev を引数として受け取る形にしてある。
+   ================================================================ *)
+
+(* ---------------- 補助 ---------------- *)
+let rec range a b = if a > b then [] else a :: range (a + 1) b;
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec iter f l = match l with [] -> () | x :: r -> let u = f x in iter f r;
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+
+(* 節点は (種別, 名前, 数) の三つ組 *)
+let tagOf t = fst t;
+let namOf t = fst (snd t);
+let numOf t = snd (snd t);
+
+(* ---------------- 節点の引数の個数 ---------------- *)
+let arity t =
+  let g = tagOf t in
+  if g = "n" || g = "v" then 0
+  else if g = "~" then 1
+  else if g = "let" then 2
+  else if g = "if" then 3
+  else if g = "call" then numOf t
+  else 2;                         (* 二項演算子 *)
+
+(* 前置記法の列から、部分木を k 個ぶん読み飛ばす。
+   節点を一つ捨てると、その引数 arity 個が新たに読み飛ばし対象になる。 *)
+let rec skipn k code =
+  if k = 0 then code
+  else match code with
+         [] -> []
+       | t :: r -> skipn (k - 1 + arity t) r;
+let skip1 code = skipn 1 code;
+
+(* ---------------- 環境と定義表 ---------------- *)
+let rec look x env =
+  match env with
+    [] -> 0
+  | p :: r -> if fst p = x then snd p else look x r;
+
+let rec findf f defs =
+  match defs with
+    [] -> ([], [])
+  | d :: r -> if fst d = f then snd d else findf f r;
+
+let rec bind pv env =
+  match pv with
+    ([], _) -> env
+  | (_, []) -> env
+  | (p :: pr, v :: vr) -> (p, v) :: bind (pr, vr) env;
+
+(* ---------------- 二項演算 ---------------- *)
+let binop g a b =
+  if g = "+" then a + b
+  else if g = "-" then a - b
+  else if g = "*" then a * b
+  else if g = "/" then a / b
+  else if g = "%" then a mod b
+  else if g = "<" then (if a < b then 1 else 0)
+  else if g = ">" then (if a > b then 1 else 0)
+  else if g = "<=" then (if a <= b then 1 else 0)
+  else if g = ">=" then (if a >= b then 1 else 0)
+  else if g = "=" then (if a = b then 1 else 0)
+  else if g = "#" then (if a <> b then 1 else 0)
+  else if g = "&" then (if a <> 0 && b <> 0 then 1 else 0)
+  else if g = "|" then (if a <> 0 || b <> 0 then 1 else 0)
+  else 0;
+
+(* 引数を k 個ぶん順に評価する。ev と相互再帰にできないので
+   評価関数 evf を引数で受け取る。 *)
+let rec evargs evf k code env defs =
+  if k = 0 then ([], code)
+  else
+    let p = evf code env defs in
+    let q = evargs evf (k - 1) (snd p) env defs in
+    (fst p :: fst q, snd q);
+
+(* ---------------- 評価器の本体 ----------------
+   ev code env defs = (値, 残りの列)                             *)
+let rec ev code env defs =
+  match code with
+    [] -> (0, [])
+  | t :: r ->
+      let g = tagOf t in
+      if g = "n" then (numOf t, r)
+      else if g = "v" then (look (namOf t) env, r)
+      else if g = "~" then
+        (let a = ev r env defs in (0 - fst a, snd a))
+      else if g = "if" then
+        (let c = ev r env defs in
+         if fst c <> 0
+         then (let a = ev (snd c) env defs in (fst a, skip1 (snd a)))
+         else (let a = ev (skip1 (snd c)) env defs in (fst a, snd a)))
+      else if g = "let" then
+        (let a = ev r env defs in
+         let b = ev (snd a) ((namOf t, fst a) :: env) defs in
+         (fst b, snd b))
+      else if g = "call" then
+        (let ps = evargs ev (numOf t) r env defs in
+         let fd = findf (namOf t) defs in
+         let b = ev (snd fd) (bind (fst fd, fst ps) []) defs in
+         (fst b, snd ps))
+      else
+        (let a = ev r env defs in
+         let b = ev (snd a) env defs in
+         (binop g (fst a) (fst b), snd b));
+
+let run defs code = fst (ev code [] defs);
+
+(* ================================================================
+   逆アセンブラ。前置記法の列を、読める形の式に戻す。
+   evargs と同じ理由で、引数の並びを扱う補助には自分自身を渡す。
+   ================================================================ *)
+let rec unpargs unpf k code =
+  if k = 0 then ("", code)
+  else
+    let p = unpf code in
+    let q = unpargs unpf (k - 1) (snd p) in
+    (" " ^ fst p ^ fst q, snd q);
+
+let rec unp code =
+  match code with
+    [] -> ("", [])
+  | t :: r ->
+      let g = tagOf t in
+      if g = "n" then (string_of_int (numOf t), r)
+      else if g = "v" then (namOf t, r)
+      else if g = "~" then (let a = unp r in ("(-" ^ fst a ^ ")", snd a))
+      else if g = "if" then
+        (let c = unp r in
+         let a = unp (snd c) in
+         let b = unp (snd a) in
+         ("(if " ^ fst c ^ " then " ^ fst a ^ " else " ^ fst b ^ ")", snd b))
+      else if g = "let" then
+        (let a = unp r in
+         let b = unp (snd a) in
+         ("(let " ^ namOf t ^ " = " ^ fst a ^ " in " ^ fst b ^ ")", snd b))
+      else if g = "call" then
+        (let a = unpargs unp (numOf t) r in
+         ("(" ^ namOf t ^ fst a ^ ")", snd a))
+      else
+        (let a = unp r in
+         let b = unp (snd a) in
+         ("(" ^ fst a ^ " " ^ (if g = "%" then "mod" else if g = "#" then "<>"
+                               else if g = "&" then "&&" else if g = "|" then "||"
+                               else g) ^ " " ^ fst b ^ ")", snd b));
+
+let unparse code = fst (unp code);
+
+(* ================================================================
+   組み立て用の記法。前置記法で書けるようにする。
+   ================================================================ *)
+let num_ k   = ("n", "", k);
+let var_ x   = ("v", x, 0);
+let op_ g    = (g, "", 0);
+let if_ = ("if", "", 0);
+let let_ x   = ("let", x, 0);
+let call_ f k = ("call", f, k);
+let neg_     = ("~", "", 0);
+
+(* ================================================================
+   対象プログラム
+   ================================================================ *)
+
+(* fac n = if n = 0 then 1 else n * fac (n-1) *)
+let d_fac () = ("fac", (["n"],
+  [ if_; op_ "="; var_ "n"; num_ 0;
+        num_ 1;
+        op_ "*"; var_ "n"; call_ "fac" 1; op_ "-"; var_ "n"; num_ 1 ]));
+
+(* fib n = if n < 2 then n else fib (n-1) + fib (n-2) *)
+let d_fib () = ("fib", (["n"],
+  [ if_; op_ "<"; var_ "n"; num_ 2;
+        var_ "n";
+        op_ "+"; call_ "fib" 1; op_ "-"; var_ "n"; num_ 1;
+                 call_ "fib" 1; op_ "-"; var_ "n"; num_ 2 ]));
+
+(* gcd a b = if b = 0 then a else gcd b (a mod b) *)
+let d_gcd () = ("gcd", (["a"; "b"],
+  [ if_; op_ "="; var_ "b"; num_ 0;
+        var_ "a";
+        call_ "gcd" 2; var_ "b"; op_ "%"; var_ "a"; var_ "b" ]));
+
+(* pow b k = if k = 0 then 1 else b * pow b (k-1) *)
+let d_pow () = ("pow", (["b"; "k"],
+  [ if_; op_ "="; var_ "k"; num_ 0;
+        num_ 1;
+        op_ "*"; var_ "b"; call_ "pow" 2; var_ "b"; op_ "-"; var_ "k"; num_ 1 ]));
+
+(* clen n = if n = 1 then 1
+            else 1 + clen (if n mod 2 = 0 then n/2 else 3*n+1) *)
+let d_clen () = ("clen", (["n"],
+  [ if_; op_ "="; var_ "n"; num_ 1;
+        num_ 1;
+        op_ "+"; num_ 1;
+          call_ "clen" 1;
+            if_; op_ "="; op_ "%"; var_ "n"; num_ 2; num_ 0;
+                op_ "/"; var_ "n"; num_ 2;
+                op_ "+"; op_ "*"; num_ 3; var_ "n"; num_ 1 ]));
+
+(* hasf n d = if d*d > n then 0 else if n mod d = 0 then 1 else hasf n (d+1) *)
+let d_hasf () = ("hasf", (["n"; "d"],
+  [ if_; op_ ">"; op_ "*"; var_ "d"; var_ "d"; var_ "n";
+        num_ 0;
+        if_; op_ "="; op_ "%"; var_ "n"; var_ "d"; num_ 0;
+            num_ 1;
+            call_ "hasf" 2; var_ "n"; op_ "+"; var_ "d"; num_ 1 ]));
+
+(* isp a = if a < 2 then 0 else 1 - hasf a 2 *)
+let d_isp () = ("isp", (["a"],
+  [ if_; op_ "<"; var_ "a"; num_ 2;
+        num_ 0;
+        op_ "-"; num_ 1; call_ "hasf" 2; var_ "a"; num_ 2 ]));
+
+(* countp a b = if a > b then 0 else isp a + countp (a+1) b *)
+let d_countp () = ("countp", (["a"; "b"],
+  [ if_; op_ ">"; var_ "a"; var_ "b";
+        num_ 0;
+        op_ "+"; call_ "isp" 1; var_ "a";
+                 call_ "countp" 2; op_ "+"; var_ "a"; num_ 1; var_ "b" ]));
+
+(* sumto n = if n = 0 then 0 else n + sumto (n-1) *)
+let d_sumto () = ("sumto", (["n"],
+  [ if_; op_ "="; var_ "n"; num_ 0;
+        num_ 0;
+        op_ "+"; var_ "n"; call_ "sumto" 1; op_ "-"; var_ "n"; num_ 1 ]));
+
+let dfs () = [d_fac (); d_fib (); d_gcd (); d_pow (); d_clen (); d_hasf ();
+              d_isp (); d_countp (); d_sumto ()];
+
+(* ================================================================
+   実行
+   ================================================================ *)
+
+let rec joins sep l = match l with [] -> "" | [x] -> x | x :: r -> x ^ sep ^ joins sep r;
+let show s x = print_string (s ^ " = " ^ string_of_int x ^ "\n");
+let check s b = print_string ("  " ^ (if b then "OK  " else "NG  ") ^ s ^ "\n");
+let unquote s = s;
+let showdef d =
+  print_string ("  " ^ fst d ^ " " ^ joins " " (fst (snd d)) ^ " = "
+                ^ unparse (snd (snd d)) ^ "\n");
+
+(* 与えた記号列が、確かにあの定義であることを逆アセンブラで確かめる *)
+print_string "-- 対象プログラム（記号列を逆アセンブルしたもの）--\n";
+iter showdef (dfs ());
+
+print_string "-- 式の評価 --\n";
+iter (fun c -> print_string ("  " ^ unparse c ^ "  ==>  "
+                             ^ string_of_int (run (dfs ()) c) ^ "\n"))
+     [ [op_ "+"; num_ 1; op_ "*"; num_ 2; num_ 3];
+       [let_ "x"; num_ 5; op_ "*"; var_ "x"; var_ "x"];
+       [if_; op_ "<"; num_ 3; num_ 4; num_ 111; num_ 222];
+       [let_ "a"; num_ 6; let_ "b"; num_ 7; op_ "*"; var_ "a"; var_ "b"];
+       [op_ "&"; op_ "<"; num_ 1; num_ 2; op_ ">"; num_ 5; num_ 3];
+       [neg_; op_ "-"; num_ 3; num_ 10] ];
+
+print_string "-- 再帰関数の呼び出し --\n";
+show "  fac 10" (run (dfs ()) [call_ "fac" 1; num_ 10]);
+show "  fac 30" (run (dfs ()) [call_ "fac" 1; num_ 30]);
+show "  fac 100" (run (dfs ()) [call_ "fac" 1; num_ 100]);
+show "  fib 25" (run (dfs ()) [call_ "fib" 1; num_ 25]);
+show "  gcd 1071 462" (run (dfs ()) [call_ "gcd" 2; num_ 1071; num_ 462]);
+show "  pow 2 100" (run (dfs ()) [call_ "pow" 2; num_ 2; num_ 100]);
+show "  clen 27" (run (dfs ()) [call_ "clen" 1; num_ 27]);
+show "  countp 1 1000" (run (dfs ()) [call_ "countp" 2; num_ 1; num_ 1000]);
+show "  sumto 100" (run (dfs ()) [call_ "sumto" 1; num_ 100]);
+
+map (fun k -> run (dfs ()) [call_ "fac" 1; num_ k]) (range 0 10);
+map (fun k -> run (dfs ()) [call_ "fib" 1; num_ k]) (range 0 15);
+
+(* ================================================================
+   検算: 同じ計算を MiniML そのもので書いて突き合わせる
+   ================================================================ *)
+let rec nfac n = if n = 0 then 1 else n * nfac (n - 1);
+let rec nfib n = if n < 2 then n else nfib (n - 1) + nfib (n - 2);
+let rec ngcd a b = if b = 0 then a else ngcd b (a mod b);
+let rec npow b k = if k = 0 then 1 else b * npow b (k - 1);
+let rec nclen n = if n = 1 then 1
+                  else 1 + nclen (if n mod 2 = 0 then n / 2 else 3 * n + 1);
+let rec nhasf n d = if d * d > n then 0
+                    else if n mod d = 0 then 1 else nhasf n (d + 1);
+let rec ncountp a b = if a > b then 0
+                      else (if a < 2 then 0 else 1 - nhasf a 2) + ncountp (a + 1) b;
+
+print_string "-- メタ評価器の結果と、MiniML 直書きの結果の照合 --\n";
+check "fac 100"       (run (dfs ()) [call_ "fac" 1; num_ 100] = nfac 100);
+check "fib 25"        (run (dfs ()) [call_ "fib" 1; num_ 25] = nfib 25);
+check "gcd 1071 462"  (run (dfs ()) [call_ "gcd" 2; num_ 1071; num_ 462] = ngcd 1071 462);
+check "pow 2 100"     (run (dfs ()) [call_ "pow" 2; num_ 2; num_ 100] = npow 2 100);
+check "clen 27"       (run (dfs ()) [call_ "clen" 1; num_ 27] = nclen 27);
+check "countp 1 1000" (run (dfs ()) [call_ "countp" 2; num_ 1; num_ 1000] = ncountp 1 1000);
+check "fac 0..10"     (map (fun k -> run (dfs ()) [call_ "fac" 1; num_ k]) (range 0 10)
+                       = map nfac (range 0 10));
+check "fib 0..15"     (map (fun k -> run (dfs ()) [call_ "fib" 1; num_ k]) (range 0 15)
+                       = map nfib (range 0 15));
+check "clen 1..30"    (map (fun k -> run (dfs ()) [call_ "clen" 1; num_ k]) (range 1 30)
+                       = map nclen (range 1 30));
