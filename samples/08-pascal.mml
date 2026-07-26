@@ -1,0 +1,41 @@
+(* ================================================================
+   08 パスカルの三角形
+   ================================================================ *)
+let rec range a b = if a > b then [] else a :: range (a + 1) b;
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec append l1 l2 = match l1 with [] -> l2 | x :: r -> x :: append r l2;
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+let rec sum l = match l with [] -> 0 | x :: r -> x + sum r;
+
+(* 隣り合う項の和 *)
+let rec sums row = match row with a :: b :: r -> (a + b) :: sums (b :: r) | _ -> [];
+let next_row row = 1 :: append (sums row) [1];
+
+let rec rows n row = if n = 0 then [] else row :: rows (n - 1) (next_row row);
+
+rows 10 [1];
+
+(* 第 n 行の和は 2^n *)
+let rec pow b n = if n = 0 then 1 else b * pow b (n - 1);
+map sum (rows 10 [1]);
+map (fun n -> pow 2 n) (range 0 9);
+map sum (rows 10 [1]) = map (fun n -> pow 2 n) (range 0 9);
+
+(* 三角形に整形して表示 *)
+let rec spaces k = if k <= 0 then "" else " " ^ spaces (k - 1);
+let rec join sep l =
+  match l with
+    [] -> ""
+  | [x] -> string_of_int x
+  | x :: r -> string_of_int x ^ sep ^ join sep r;
+let rec draw i total rs =
+  match rs with
+    [] -> ""
+  | row :: r -> spaces (2 * (total - i)) ^ join "   " row ^ "\n" ^ draw (i + 1) total r;
+
+print_string (draw 0 9 (rows 9 [1]));
+
+(* 多倍長なので何行でも正確 *)
+let rec last l = match l with [] -> 0 | [x] -> x | _ :: r -> last r;
+let rec nth_row n row = if n = 0 then row else nth_row (n - 1) (next_row row);
+nth_row 100 [1];

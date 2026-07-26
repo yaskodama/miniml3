@@ -1,0 +1,200 @@
+(* ================================================================
+   miniml.grm -- ML-Yacc の文法定義。
+   miniml2 の手書き再帰下降パーザと同じ言語を、同じ結合と優先順位で
+   受理する。優先順位は非終端記号の層でそのまま表現しているので、
+   %left / %right の宣言には頼っていない。
+
+   結合の弱い順に
+       ,   ||   &&   = <> < > <= >=   ::   ^   + -   * / mod   適用
+   ================================================================ *)
+
+open Absyn
+
+%%
+
+%name Miniml
+%pos int
+%verbose
+%eop EOF SEMI
+%noshift EOF
+
+%term
+    NUM of Absyn.num
+  | STRING of string
+  | ID of string
+  | LET | REC | IN
+  | IF | THEN | ELSE
+  | FUN | FUNCTION | MATCH | WITH
+  | TRUE | FALSE
+  | PLUS | MINUS | TIMES | DIVIDE | MOD
+  | EQ | NE | LT | GT | LE | GE
+  | CARET | ANDALSO | ORELSE
+  | ARROW | CONS | COMMA | BAR | UNDERSCORE
+  | LPAREN | RPAREN | LBRACKET | RBRACKET | SEMI
+  | EOF
+
+%nonterm
+    phrase     of Absyn.definition
+  | definition of Absyn.definition
+  | letbind    of bool * string * Absyn.expr
+  | letname    of bool * string * Absyn.motif list
+  | params     of Absyn.motif list
+  | cases      of (Absyn.motif * Absyn.expr) list
+  | caselist   of (Absyn.motif * Absyn.expr) list
+  | exp        of Absyn.expr
+  | tupexp     of Absyn.expr
+  | orexp      of Absyn.expr
+  | andexp     of Absyn.expr
+  | cmpexp     of Absyn.expr
+  | consexp    of Absyn.expr
+  | catexp     of Absyn.expr
+  | addexp     of Absyn.expr
+  | mulexp     of Absyn.expr
+  | appexp     of Absyn.expr
+  | appseq     of Absyn.expr
+  | atexp      of Absyn.expr
+  | elems      of Absyn.expr
+  | motif      of Absyn.motif
+  | consmotif  of Absyn.motif
+  | atmotif    of Absyn.motif
+  | motiflist  of Absyn.motif
+
+%start phrase
+
+%%
+
+(* ---------------- 一つのフレーズ ---------------- *)
+
+phrase
+  : definition                     (definition)
+
+definition
+  : LET letbind                    (let val (r, n, e) = letbind in Def (r, n, e) end)
+  | exp                            (Expr exp)
+
+letbind
+  : letname EQ exp                 (let val (r, n, ps) = letname
+                                    in (r, n, curry_fun ps exp) end)
+
+letname
+  : ID                             ((false, ID, []))
+  | ID params                      ((false, ID, params))
+  | REC ID                         ((true, ID, []))
+  | REC ID params                  ((true, ID, params))
+
+params
+  : atmotif                        ([atmotif])
+  | params atmotif                 (params @ [atmotif])
+
+(* ---------------- 場合分け ---------------- *)
+
+cases
+  : caselist                       (caselist)
+  | BAR caselist                   (caselist)
+
+caselist
+  : motif ARROW exp                ([(motif, exp)])
+  | caselist BAR motif ARROW exp   (caselist @ [(motif, exp)])
+
+(* ---------------- 式 ---------------- *)
+
+exp
+  : IF exp THEN exp ELSE exp       (If (exp1, exp2, exp3))
+  | FUN params ARROW exp           (curry_fun params exp)
+  | FUNCTION cases                 (Function cases)
+  | MATCH exp WITH cases           (Application (Function cases, exp))
+  | LET letbind IN exp             (let val (r, n, e) = letbind
+                                    in Let (r, n, e, exp) end)
+  | tupexp                         (tupexp)
+
+tupexp
+  : orexp COMMA tupexp             (Pair (orexp, tupexp))
+  | orexp                          (orexp)
+
+orexp
+  : orexp ORELSE andexp            (If (orexp, Boolean true, andexp))
+  | andexp                         (andexp)
+
+andexp
+  : andexp ANDALSO cmpexp          (If (andexp, cmpexp, Boolean false))
+  | cmpexp                         (cmpexp)
+
+cmpexp
+  : cmpexp EQ consexp              (binop "="  cmpexp consexp)
+  | cmpexp NE consexp              (binop "<>" cmpexp consexp)
+  | cmpexp LT consexp              (binop "<"  cmpexp consexp)
+  | cmpexp GT consexp              (binop ">"  cmpexp consexp)
+  | cmpexp LE consexp              (binop "<=" cmpexp consexp)
+  | cmpexp GE consexp              (binop ">=" cmpexp consexp)
+  | consexp                        (consexp)
+
+consexp
+  : catexp CONS consexp            (Cons (catexp, consexp))
+  | catexp                         (catexp)
+
+catexp
+  : addexp CARET catexp            (binop "^" addexp catexp)
+  | addexp                         (addexp)
+
+addexp
+  : addexp PLUS mulexp             (binop "+" addexp mulexp)
+  | addexp MINUS mulexp            (binop "-" addexp mulexp)
+  | mulexp                         (mulexp)
+
+mulexp
+  : mulexp TIMES appexp            (binop "*"   mulexp appexp)
+  | mulexp DIVIDE appexp           (binop "/"   mulexp appexp)
+  | mulexp MOD appexp              (binop "mod" mulexp appexp)
+  | appexp                         (appexp)
+
+appexp
+  : MINUS appexp                   (binop "-" (Number 0) appexp)
+  | appseq                         (appseq)
+
+appseq
+  : appseq atexp                   (Application (appseq, atexp))
+  | atexp                          (atexp)
+
+atexp
+  : NUM                            (Number NUM)
+  | STRING                         (Str STRING)
+  | ID                             (Variable ID)
+  | TRUE                           (Boolean true)
+  | FALSE                          (Boolean false)
+  | LPAREN RPAREN                  (Unit)
+  | LPAREN exp RPAREN              (exp)
+  | LBRACKET RBRACKET              (Nil)
+  | LBRACKET elems RBRACKET        (elems)
+
+elems
+  : exp                            (Cons (exp, Nil))
+  | exp SEMI                       (Cons (exp, Nil))
+  | exp SEMI elems                 (Cons (exp, elems))
+
+(* ---------------- パターン ---------------- *)
+
+motif
+  : consmotif COMMA motif          (Motif_pair (consmotif, motif))
+  | consmotif                      (consmotif)
+
+consmotif
+  : atmotif CONS consmotif         (Motif_cons (atmotif, consmotif))
+  | atmotif                        (atmotif)
+
+atmotif
+  : ID                             (Motif_variable ID)
+  | UNDERSCORE                     (Motif_wild)
+  | NUM                            (Motif_number NUM)
+  | MINUS NUM                      (Motif_number (IntInf.~ NUM))
+  | STRING                         (Motif_string STRING)
+  | TRUE                           (Motif_boolean true)
+  | FALSE                          (Motif_boolean false)
+  | LPAREN RPAREN                  (Motif_unit)
+  | LPAREN motif RPAREN            (motif)
+  | LBRACKET RBRACKET              (Motif_nil)
+  | LBRACKET motiflist RBRACKET    (motiflist)
+
+motiflist
+  : motif                          (Motif_cons (motif, Motif_nil))
+  | motif SEMI                     (Motif_cons (motif, Motif_nil))
+  | motif SEMI motiflist           (Motif_cons (motif, motiflist))

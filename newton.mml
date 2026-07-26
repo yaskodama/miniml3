@@ -1,0 +1,136 @@
+(* ================================================================
+   newton.mml -- ニュートン法
+   実行:  ./minicaml2 newton.mml
+
+   この言語の数は整数だけなので、二通りのやり方を示す。
+     (1) 整数解をそのまま求める（整数平方根など）
+     (2) 10^k 倍した固定小数点で小数を表す
+   ================================================================ *)
+
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec range a b = if a > b then [] else a :: range (a + 1) b;
+
+(* ================================================================
+   1. 整数平方根   x <- (x + n/x) / 2
+   x は上から単調に減るので、減らなくなったら打ち切る。
+   ================================================================ *)
+let rec sqrt_iter n x =
+  let next = (x + n / x) / 2 in
+  if next >= x then x else sqrt_iter n next;
+
+let isqrt n = if n = 0 then 0 else sqrt_iter n n;
+
+map isqrt [0; 1; 2; 3; 4; 10; 100; 12345; 1000000];
+
+(* 検算: s = isqrt n なら s*s <= n < (s+1)*(s+1) *)
+let ok n = let s = isqrt n in s * s <= n && n < (s + 1) * (s + 1);
+map ok (range 0 40);
+
+(* 収束のようす *)
+let rec sqrt_trace n x k =
+  let _p = print_string ("  x" ^ string_of_int k ^ " = "
+                         ^ string_of_int x ^ "\n") in
+  let next = (x + n / x) / 2 in
+  if next >= x then x else sqrt_trace n next (k + 1);
+
+print_string "isqrt 100000 の収束:\n";
+sqrt_trace 100000 100000 0;
+
+(* ================================================================
+   2. 固定小数点で小数を出す
+   ================================================================ *)
+let rec ndigits n = if n < 10 then 1 else 1 + ndigits (n / 10);
+let rec zeros k = if k <= 0 then "" else "0" ^ zeros (k - 1);
+
+(* x を s 倍された数とみなして小数点以下 d 桁で表示する。
+   部分適用で桁数ごとの表示関数を作る。 *)
+let show_scaled d s x =
+  let f = x mod s in
+  string_of_int (x / s) ^ "." ^ zeros (d - ndigits f) ^ string_of_int f;
+
+let scale = 1000000;
+let show_fixed = show_scaled 6 scale;
+
+(* sqrt a を小数第 6 位まで。
+   a*scale^2 の整数平方根が sqrt(a)*scale になる。 *)
+let sqrt_fixed a = sqrt_iter (a * scale * scale) (a * scale);
+
+map (fun a -> show_fixed (sqrt_fixed a)) [1; 2; 3; 5; 10; 2026];
+
+(* 黄金比 phi = (1 + sqrt 5) / 2 = 1.6180339... *)
+show_fixed ((scale + sqrt_fixed 5) / 2);
+
+(* ================================================================
+   3. 立方根   x <- (2x + A/x^2) / 3
+   A = a * scale^3 は 10^18 を超えるが、整数は多倍長なので問題ない。
+   ================================================================ *)
+let rec cbrt_iter m x =
+  let next = (2 * x + m / (x * x)) / 3 in
+  if next >= x then x else cbrt_iter m next;
+
+let cbrt_fixed a = cbrt_iter (a * scale * scale * scale) (a * scale);
+
+map (fun a -> show_fixed (cbrt_fixed a)) [1; 2; 8; 27; 100; 1000];
+
+(* ================================================================
+   4. 一般のニュートン法（高階関数で f と f' を受け取る）
+        x <- x - f(x) / f'(x)
+   ================================================================ *)
+let rec newton f df x fuel =
+  if fuel = 0 then x
+  else
+    let next = x - f x / df x in
+    if next = x then x else newton f df next (fuel - 1);
+
+let sq   a = fun x -> x * x - a;
+let dsq  a = fun x -> 2 * x;
+let cube a = fun x -> x * x * x - a;
+let dcube a = fun x -> 3 * x * x;
+
+(* 整数の割り算は切り捨てなので、反復は根の「1 つ上」で止まりうる。
+   x^2 = 1234321 の根は 1111 だが、x = 1112 では
+   f(x)/f'(x) = 2223/2224 = 0 となって動かなくなる。 *)
+newton (sq 1234321) (dsq 1234321) 1000000 60;
+newton (cube 2985984) (dcube 2985984) 1000000 60;
+
+(* そこで、止まった点から f(x) <= 0 になるまで 1 ずつ降ろして仕上げる。 *)
+let rec descend f x = if f x > 0 then descend f (x - 1) else x;
+let solve f df x0 = descend f (newton f df x0 60);
+
+solve (sq 1234321) (dsq 1234321) 1000000;
+solve (cube 2985984) (dcube 2985984) 1000000;
+
+(* 5 乗根: x^5 = 33554432  ->  32 *)
+solve (fun x -> x * x * x * x * x - 33554432)
+      (fun x -> 5 * x * x * x * x) 1000;
+
+(* 固定小数点で解く例: x^2 - 2 = 0 を scale 倍の世界で。
+     f(x)  = x^2/scale - 2*scale
+     f'(x) = 2*x/scale                                      *)
+show_fixed (newton (fun x -> x * x / scale - 2 * scale)
+                   (fun x -> 2 * x / scale)
+                   (2 * scale) 60);
+show_fixed (sqrt_fixed 2);
+
+(* ================================================================
+   5. 反復回数。二次収束なので、桁数が増えても回数はゆっくりしか
+      増えない（下は 10^0, 10^2, 10^4, 10^6 倍の n に対する回数）。
+   ================================================================ *)
+let rec sqrt_steps n x k =
+  let next = (x + n / x) / 2 in
+  if next >= x then k else sqrt_steps n next (k + 1);
+
+map (fun a -> sqrt_steps (a * scale * scale) (a * scale) 0)
+    [2; 200; 20000; 2000000];
+
+(* ================================================================
+   6. 多倍長なので、桁数はいくらでも増やせる。
+      sqrt 2 を小数第 40 位まで求める。
+   ================================================================ *)
+let rec pow b n = if n = 0 then 1 else b * pow b (n - 1);
+let big = pow 10 40;
+let show_big = show_scaled 40 big;
+
+show_big (sqrt_iter (2 * big * big) (2 * big));
+show_big (sqrt_iter (3 * big * big) (3 * big));
+show_big ((big + sqrt_iter (5 * big * big) (5 * big)) / 2);

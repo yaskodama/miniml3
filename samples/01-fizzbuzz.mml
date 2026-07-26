@@ -1,0 +1,26 @@
+(* ================================================================
+   01 FizzBuzz
+   ================================================================ *)
+let rec range a b = if a > b then [] else a :: range (a + 1) b;
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec iter f l = match l with [] -> () | x :: r -> let u = f x in iter f r;
+
+let fizzbuzz n =
+  if n mod 15 = 0 then "FizzBuzz"
+  else if n mod 3 = 0 then "Fizz"
+  else if n mod 5 = 0 then "Buzz"
+  else string_of_int n;
+
+(* 値として *)
+map fizzbuzz (range 1 20);
+
+(* 印字して *)
+iter (fun n -> print_string (fizzbuzz n ^ " ")) (range 1 30);
+print_newline ();
+
+(* 何個ずつ出たか *)
+let rec count p l = match l with [] -> 0 | x :: r -> (if p x then 1 else 0) + count p r;
+let ws = map fizzbuzz (range 1 100);
+count (fun s -> s = "Fizz") ws;
+count (fun s -> s = "Buzz") ws;
+count (fun s -> s = "FizzBuzz") ws;

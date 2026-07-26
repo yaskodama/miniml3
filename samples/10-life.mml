@@ -1,0 +1,67 @@
+(* ================================================================
+   10 ライフゲーム -- 盤面は int のリストのリスト
+   ================================================================ *)
+let rec range a b = if a > b then [] else a :: range (a + 1) b;
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+
+(* 盤外は 0 とみなす *)
+let rec nth_int l i =
+  if i < 0 then 0
+  else match l with [] -> 0 | x :: r -> if i = 0 then x else nth_int r (i - 1);
+let rec nth_row b y =
+  if y < 0 then []
+  else match b with [] -> [] | x :: r -> if y = 0 then x else nth_row r (y - 1);
+let cell b y x = nth_int (nth_row b y) x;
+
+let neighbours b y x =
+  cell b (y - 1) (x - 1) + cell b (y - 1) x + cell b (y - 1) (x + 1)
+  + cell b y (x - 1) + cell b y (x + 1)
+  + cell b (y + 1) (x - 1) + cell b (y + 1) x + cell b (y + 1) (x + 1);
+
+let step_cell b y x =
+  let n = neighbours b y x in
+  if cell b y x = 1 then (if n = 2 || n = 3 then 1 else 0)
+  else (if n = 3 then 1 else 0);
+
+let rec build_row b y x w = if x >= w then [] else step_cell b y x :: build_row b y (x + 1) w;
+let rec build b y h w = if y >= h then [] else build_row b y 0 w :: build b (y + 1) h w;
+let step b h w = build b 0 h w;
+
+let rec show_row row = match row with [] -> "" | c :: r -> (if c = 1 then "#" else ".") ^ show_row r;
+let rec show_board b = match b with [] -> "" | row :: r -> show_row row ^ "\n" ^ show_board r;
+
+(* ブリンカー: 周期 2 *)
+let blinker = [[0; 0; 0; 0; 0];
+               [0; 0; 1; 0; 0];
+               [0; 0; 1; 0; 0];
+               [0; 0; 1; 0; 0];
+               [0; 0; 0; 0; 0]];
+print_string (show_board blinker);
+print_string (show_board (step blinker 5 5));
+step (step blinker 5 5) 5 5 = blinker;
+
+(* ブロック: 静止 *)
+let block = [[0; 0; 0; 0]; [0; 1; 1; 0]; [0; 1; 1; 0]; [0; 0; 0; 0]];
+step block 4 4 = block;
+
+(* グライダー: 4 世代で右下に 1 ずつずれる *)
+let glider = [[0; 1; 0; 0; 0; 0; 0; 0];
+              [0; 0; 1; 0; 0; 0; 0; 0];
+              [1; 1; 1; 0; 0; 0; 0; 0];
+              [0; 0; 0; 0; 0; 0; 0; 0];
+              [0; 0; 0; 0; 0; 0; 0; 0];
+              [0; 0; 0; 0; 0; 0; 0; 0];
+              [0; 0; 0; 0; 0; 0; 0; 0];
+              [0; 0; 0; 0; 0; 0; 0; 0]];
+
+let rec run b h w n =
+  let u = print_string (show_board b ^ "\n") in
+  if n = 0 then b else run (step b h w) h w (n - 1);
+
+run glider 8 8 4;
+
+(* 生きているセルの数 *)
+let rec sum l = match l with [] -> 0 | x :: r -> x + sum r;
+let alive b = sum (map sum b);
+alive glider;
+alive (run glider 8 8 0);

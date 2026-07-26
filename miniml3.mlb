@@ -1,0 +1,11 @@
+$(SML_LIB)/basis/basis.mlb
+$(SML_LIB)/mlyacc-lib/mlyacc-lib.mlb
+absyn.sml
+miniml.grm.sig
+miniml.grm.sml
+miniml.lex.sml
+value.sml
+types.sml
+show.sml
+prims.sml
+main.sml

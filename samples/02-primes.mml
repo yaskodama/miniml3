@@ -1,0 +1,43 @@
+(* ================================================================
+   02 素数 -- エラトステネスの篩と試し割り
+   ================================================================ *)
+let rec range a b = if a > b then [] else a :: range (a + 1) b;
+let rec filter p l = match l with [] -> [] | x :: r -> if p x then x :: filter p r else filter p r;
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+
+(* 篩: 先頭を素数として確定し、その倍数を落として繰り返す *)
+let rec sieve l =
+  match l with
+    [] -> []
+  | p :: rest -> p :: sieve (filter (fun x -> x mod p <> 0) rest);
+
+let primes n = sieve (range 2 n);
+primes 100;
+length (primes 1000);
+
+(* 試し割りによる判定 *)
+let rec has_factor n d =
+  if d * d > n then false
+  else if n mod d = 0 then true
+  else has_factor n (d + 1);
+let is_prime n = n >= 2 && not (has_factor n 2);
+filter is_prime (range 1 60);
+is_prime 1000003;
+is_prime 1000001;
+
+(* 双子素数 *)
+let rec twins l =
+  match l with
+    a :: b :: r -> if b - a = 2 then (a, b) :: twins (b :: r) else twins (b :: r)
+  | _ -> [];
+twins (primes 200);
+
+(* 素因数分解 *)
+let rec factor_from n d =
+  if n = 1 then []
+  else if d * d > n then [n]
+  else if n mod d = 0 then d :: factor_from (n / d) d
+  else factor_from n (d + 1);
+let factorize n = factor_from n 2;
+map factorize [360; 1001; 65536; 123456789];

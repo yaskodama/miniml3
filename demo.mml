@@ -1,0 +1,127 @@
+(* ================================================================
+   demo.mml -- a tour of the syntax MINICAML2 accepts.
+   Run it with:   runFile "demo.mml";
+   ================================================================ *)
+
+(* ---- 1. arithmetic: unary minus, mod, precedence, (* nesting *) ---- *)
+2 + 3 * 4;
+-7 mod 3;
+(1 + 2) * (10 - 4) / 3;
+
+(* ---- 2. if / then / else, and function-definition sugar ---- *)
+let rec fac n = if n = 0 then 1 else n * fac (n - 1);
+fac 12;
+
+let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2);
+fib 20;
+
+(* ---- 3. list literals and list patterns ---- *)
+[1; 2; 3; 4; 5];
+[];
+1 :: 2 :: [3; 4];
+
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+length [10; 20; 30];
+
+let rec sum l = match l with [] -> 0 | x :: r -> x + sum r;
+sum [1; 2; 3; 4; 5; 6; 7; 8; 9; 10];
+
+(* ---- 4. higher order functions, currying, anonymous "fun" ---- *)
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+map (fun x -> x * x) [1; 2; 3; 4; 5];
+
+let rec filter p l =
+  match l with
+    [] -> []
+  | x :: r -> if p x then x :: filter p r else filter p r;
+filter (fun x -> x mod 2 = 0) [1; 2; 3; 4; 5; 6; 7; 8; 9; 10];
+
+let rec fold f acc l = match l with [] -> acc | x :: r -> fold f (f acc x) r;
+fold (fun a -> fun b -> a + b) 0 [1; 2; 3; 4; 5];
+
+(* map is polymorphic: it also works on strings *)
+map (fun s -> s ^ "!") ["ah"; "oh"];
+
+let compose f g = fun x -> f (g x);
+let add1 x = x + 1;
+let double x = x * 2;
+(compose add1 double) 10;
+
+(* ---- 5. let ... in ... as a nested expression ---- *)
+let hypot2 a b = let sa = a * a in let sb = b * b in sa + sb;
+hypot2 3 4;
+
+(* ---- 6. strings ---- *)
+let greet name = "Hello, " ^ name ^ "!";
+greet "MINICAML2";
+
+let rec show l =
+  match l with
+    [] -> ""
+  | x :: [] -> string_of_int x
+  | x :: r -> string_of_int x ^ ", " ^ show r;
+show [3; 1; 4; 1; 5];
+
+print_string ("fac 10 = " ^ string_of_int (fac 10) ^ "\n");
+
+(* ---- 7. tuples, wildcards, nested patterns ---- *)
+let classify p =
+  match p with
+    (0, 0) -> "origin"
+  | (0, _) -> "on the y axis"
+  | (_, 0) -> "on the x axis"
+  | _      -> "somewhere else";
+classify (0, 0);
+classify (3, 0);
+classify (3, 7);
+
+let const x _ = x;
+const 42 "ignored";
+
+let swap p = match p with (a, b) -> (b, a);
+swap (1, "one");
+
+(* ---- 8. short-circuit && and || ---- *)
+let leap y = y mod 4 = 0 && y mod 100 <> 0 || y mod 400 = 0;
+map leap [1900; 2000; 2024; 2025];
+
+(* ---- 9. polymorphic structural equality and ordering ---- *)
+[1; 2; 3] = [1; 2; 3];
+[1; 2; 3] < [1; 2; 4];
+("a", 2) = ("a", 2);
+"apple" < "banana";
+
+(* ---- 10. a slightly bigger program: quicksort ---- *)
+let rec append l1 l2 = match l1 with [] -> l2 | x :: r -> x :: append r l2;
+
+let rec quicksort l =
+  match l with
+    [] -> []
+  | p :: rest ->
+      let smaller = filter (fun x -> x < p) rest in
+      let larger  = filter (fun x -> x >= p) rest in
+      append (quicksort smaller) (p :: quicksort larger);
+
+quicksort [5; 3; 8; 1; 9; 2; 7; 4; 6];
+quicksort ["pear"; "apple"; "fig"; "banana"];
+
+(* insertion sort over a list of pairs, ordered structurally *)
+let rec insert x l =
+  match l with
+    [] -> [x]
+  | y :: r -> if x <= y then x :: y :: r else y :: insert x r;
+let rec isort l = match l with [] -> [] | x :: r -> insert x (isort r);
+isort [(2, "b"); (1, "z"); (1, "a"); (3, "c")];
+
+(* ---- 11. the type checker still does its job ---- *)
+1 + true;
+[1; 2] :: 3;
+undefined_name 1;
+
+(* ---- 12. ... and so does the runtime ---- *)
+hd [];
+1 / 0;
+
+(* ---- 13. ... and the parser recovers from errors ---- *)
+let x = ;
+"still alive";

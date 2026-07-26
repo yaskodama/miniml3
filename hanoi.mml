@@ -1,0 +1,84 @@
+(* ================================================================
+   hanoi.mml -- ハノイの塔
+   実行:  ./minicaml2 hanoi.mml
+   ================================================================ *)
+
+(* ---- 補助関数 ---- *)
+let rec append l1 l2 = match l1 with [] -> l2 | x :: r -> x :: append r l2;
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec range a b = if a > b then [] else a :: range (a + 1) b;
+
+(* ---- 1. 手数を数える。 T(n) = 2 T(n-1) + 1 ---- *)
+let rec hanoi_count n = if n = 0 then 0 else 2 * hanoi_count (n - 1) + 1;
+map hanoi_count (range 1 10);
+
+(* 整数は多倍長なので、伝説どおりの 64 枚 (2^64-1) も、
+   その先も桁が溢れない。 *)
+hanoi_count 64;
+hanoi_count 200;
+
+(* ---- 2. 手順をリストとして組み立てる ----
+   moves n a b c : 円盤 n 枚を柱 a から柱 b へ、柱 c を作業用に使って移す *)
+let rec moves n a b c =
+  if n = 0 then []
+  else append (moves (n - 1) a c b)
+              ((a, b) :: moves (n - 1) c b a);
+
+moves 3 "A" "B" "C";
+length (moves 12 "A" "B" "C");
+
+(* ---- 3. 手順を印字する ----
+   この言語には式を並べる `;' が無いので、
+   let で捨て値に束縛して評価順を作る。 *)
+let rec hanoi n a b c =
+  if n = 0 then ()
+  else
+    let _sub1 = hanoi (n - 1) a c b in
+    let _move = print_string ("  disk " ^ string_of_int n ^ " : "
+                              ^ a ^ " -> " ^ b ^ "\n") in
+    hanoi (n - 1) c b a;
+
+print_string "hanoi 3:\n";
+hanoi 3 "A" "B" "C";
+
+(* ---- 4. 通し番号をつける（動かした枚数を返しながら回る） ---- *)
+let rec hanoi_num n a b c k =
+  if n = 0 then k
+  else
+    let k1 = hanoi_num (n - 1) a c b k in
+    let _p = print_string (string_of_int (k1 + 1) ^ ". disk "
+                           ^ string_of_int n ^ " : " ^ a ^ " -> " ^ b ^ "\n") in
+    hanoi_num (n - 1) c b a (k1 + 1);
+
+print_string "hanoi 4 (numbered):\n";
+hanoi_num 4 "A" "B" "C" 0;
+
+(* ---- 5. 3 本の柱の状態を実際に動かして検算する ----
+   柱を (名前, 円盤リスト) の対で表し、手順リストを畳み込む。
+   最後に A と C が空、B に 1..n が積まれていれば正しい。 *)
+let rec pop name pegs =
+  match pegs with
+    [] -> []
+  | (nm, ds) :: r ->
+      if nm = name then (nm, tl ds) :: r else (nm, ds) :: pop name r;
+
+let rec top name pegs =
+  match pegs with
+    [] -> 0
+  | (nm, ds) :: r -> if nm = name then hd ds else top name r;
+
+let rec push name d pegs =
+  match pegs with
+    [] -> []
+  | (nm, ds) :: r ->
+      if nm = name then (nm, d :: ds) :: r else (nm, ds) :: push name d r;
+
+let step pegs mv =
+  match mv with (a, b) -> push b (top a pegs) (pop a pegs);
+
+let rec fold f acc l = match l with [] -> acc | x :: r -> fold f (f acc x) r;
+
+let start = [("A", range 1 5); ("B", []); ("C", [])];
+start;
+fold step start (moves 5 "A" "B" "C");

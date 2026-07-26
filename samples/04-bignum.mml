@@ -1,0 +1,53 @@
+(* ================================================================
+   04 多倍長整数 -- 桁溢れが無いことを使う
+   ================================================================ *)
+let rec range a b = if a > b then [] else a :: range (a + 1) b;
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+
+let rec fac n = if n = 0 then 1 else n * fac (n - 1);
+fac 20;
+fac 50;
+fac 100;
+
+(* 繰り返し二乗法 *)
+let rec pow b n =
+  if n = 0 then 1
+  else if n mod 2 = 0 then let h = pow b (n / 2) in h * h
+  else b * pow b (n - 1);
+pow 2 64;
+pow 2 1000;
+pow 3 100;
+
+(* フィボナッチ（対を持ち回るので線形時間） *)
+let rec fib_pair n = if n = 0 then (0, 1) else let p = fib_pair (n - 1) in (snd p, fst p + snd p);
+let fib n = fst (fib_pair n);
+map fib (range 0 20);
+fib 100;
+fib 500;
+
+(* 二項係数とカタラン数 *)
+let binom n k = fac n / (fac k * fac (n - k));
+binom 100 50;
+let catalan n = binom (2 * n) n / (n + 1);
+map catalan (range 0 15);
+
+(* 桁数と桁和 *)
+let rec ndigits n = if n < 10 then 1 else 1 + ndigits (n / 10);
+let rec digitsum n = if n = 0 then 0 else n mod 10 + digitsum (n / 10);
+ndigits (fac 100);
+digitsum (fac 100);
+ndigits (pow 2 1000);
+
+(* メルセンヌ数 *)
+map (fun p -> pow 2 p - 1) [2; 3; 5; 7; 13; 17; 19; 31; 61];
+
+(* 冪剰余（RSA で使うもの）。多倍長でも途中で膨らまない *)
+let rec modpow b e m =
+  if e = 0 then 1
+  else if e mod 2 = 0 then let h = modpow b (e / 2) m in h * h mod m
+  else b * modpow b (e - 1) m mod m;
+modpow 7 1000000 1000000007;
+modpow 2 1000000000 998244353;
+
+(* フェルマーの小定理: p が素数なら a^(p-1) = 1 (mod p) *)
+map (fun a -> modpow a 1000000006 1000000007) [2; 3; 5; 7; 11];

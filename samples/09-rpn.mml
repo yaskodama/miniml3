@@ -1,0 +1,58 @@
+(* ================================================================
+   09 逆ポーランド記法の計算機
+   この言語で書いた、小さなインタプリタ。
+   ================================================================ *)
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+
+(* 記号は (種別, 値) の組。"n" なら数、それ以外は演算子名。 *)
+let num n = ("n", n);
+let op s = (s, 0);
+
+let apply s a b =
+  if s = "+" then a + b
+  else if s = "-" then a - b
+  else if s = "*" then a * b
+  else if s = "/" then a / b
+  else if s = "mod" then a mod b
+  else if s = "min" then (if a < b then a else b)
+  else if s = "max" then (if a > b then a else b)
+  else 0;
+
+let rec eval stack toks =
+  match toks with
+    [] -> (match stack with x :: _ -> x | [] -> 0)
+  | t :: r ->
+      if fst t = "n" then eval (snd t :: stack) r
+      else (match stack with
+              b :: a :: s -> eval (apply (fst t) a b :: s) r
+            | _ -> 0);
+
+let rpn toks = eval [] toks;
+
+(* 3 4 + 2 *  =  14 *)
+rpn [num 3; num 4; op "+"; num 2; op "*"];
+(* 5 1 2 + 4 * + 3 -  =  14 *)
+rpn [num 5; num 1; num 2; op "+"; num 4; op "*"; op "+"; num 3; op "-"];
+(* 2 3 4 * + 5 max  =  14 *)
+rpn [num 2; num 3; num 4; op "*"; op "+"; num 5; op "max"];
+(* 多倍長: 2 100 の冪はここでは掛け算の繰り返しで *)
+rpn [num 1000000007; num 1000000009; op "*"];
+
+(* スタックの動きを見せる *)
+let rec show_stack l =
+  match l with [] -> "" | [x] -> string_of_int x | x :: r -> string_of_int x ^ " " ^ show_stack r;
+let show_tok t = if fst t = "n" then string_of_int (snd t) else fst t;
+
+let rec trace stack toks =
+  match toks with
+    [] -> (match stack with x :: _ -> x | [] -> 0)
+  | t :: r ->
+      let next =
+        if fst t = "n" then snd t :: stack
+        else (match stack with b :: a :: s -> apply (fst t) a b :: s | _ -> stack) in
+      let u = print_string ("  " ^ show_tok t ^ "\t-> [" ^ show_stack next ^ "]\n") in
+      trace next r;
+
+print_string "5 1 2 + 4 * + 3 - の評価:\n";
+trace [] [num 5; num 1; num 2; op "+"; num 4; op "*"; op "+"; num 3; op "-"];

@@ -1,0 +1,7 @@
+# mllex / mlyacc の生成物
+miniml.lex.sml
+miniml.grm.sml
+miniml.grm.sig
+miniml.grm.desc
+# MLton の出力
+miniml3

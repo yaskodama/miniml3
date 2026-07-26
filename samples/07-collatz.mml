@@ -1,0 +1,32 @@
+(* ================================================================
+   07 コラッツ予想
+   ================================================================ *)
+let rec range a b = if a > b then [] else a :: range (a + 1) b;
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+
+let next n = if n mod 2 = 0 then n / 2 else 3 * n + 1;
+
+let rec collatz n = if n = 1 then [1] else n :: collatz (next n);
+collatz 27;
+length (collatz 27);
+map (fun n -> length (collatz n)) (range 1 20);
+
+(* 途中で到達する最大値 *)
+let rec peak n = if n = 1 then 1 else let m = peak (next n) in if n > m then n else m;
+peak 27;
+map peak (range 1 20);
+
+(* 1..b で列が最長になる数を探す *)
+let rec clen n = if n = 1 then 1 else 1 + clen (next n);
+let rec best a b bi bl =
+  if a > b then (bi, bl)
+  else let l = clen a in
+       if l > bl then best (a + 1) b a l else best (a + 1) b bi bl;
+best 1 1000 1 1;
+best 1 10000 1 1;
+
+(* 多倍長なので大きな種でも溢れない *)
+clen 1000000;
+peak 1000000;
+clen 989345275647;
