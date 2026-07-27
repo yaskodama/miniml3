@@ -1,0 +1,258 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\geometry{margin=25mm}
+
+\lstdefinelanguage{Coq}{
+  morekeywords={
+    Inductive,Definition,Fixpoint,Lemma,Theorem,Proof,Qed,forall,exists,
+    match,with,end,fun,Prop,Type,Set,apply,eapply,constructor,intros,
+    inversion,subst,destruct,reflexivity,exact
+  },
+  sensitive=true,
+  morecomment=[n]{(*}{*)}
+}
+\lstset{
+  language=Coq,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!60!black},
+  commentstyle=\color{green!35!black},
+  breaklines=true,
+  frame=single,
+  columns=fullflexible
+}
+
+\title{Coq Proofs for Hindley--Milner Inference Soundness and Type Safety}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Goal}
+
+This report summarizes two mechanized Coq developments about a small
+Hindley--Milner-style language.
+
+\begin{enumerate}
+  \item Inference soundness: if the HM inference judgement returns a type, then
+  the declarative typing judgement also assigns that type.
+  \item Type safety: a closed well-typed core term is either a value or can take
+  a step, and stepping preserves its type.
+\end{enumerate}
+
+The first part is implemented in \texttt{HMSoundness.v}.  The second part is
+implemented in \texttt{HMTypeSafety.v}.
+
+\section{Inference Soundness}
+
+\subsection{Formalization}
+
+\texttt{HMSoundness.v} defines a small expression language with variables,
+integer literals, lambda abstraction, application, and \texttt{let}.  Types are
+integer types, type variables, and arrow types.
+
+\begin{lstlisting}
+Inductive ty : Type :=
+| TInt : ty
+| TVar : nat -> ty
+| TArrow : ty -> ty -> ty.
+\end{lstlisting}
+
+The declarative typing relation is called \texttt{has\_type}.  The algorithmic
+HM inference relation is called \texttt{hm\_infer}.  Type schemes,
+instantiation, and generalization are modeled relationally.  Thus this file
+proves soundness of the inference rules with respect to declarative typing; it
+does not yet prove correctness of a concrete unification algorithm.
+
+\subsection{Main Theorem}
+
+The central theorem is:
+
+\begin{lstlisting}
+Theorem hm_infer_sound :
+  forall G e T,
+    hm_infer G e T ->
+    has_type G e T.
+\end{lstlisting}
+
+In mathematical notation:
+
+\[
+  \Gamma \vdash_{\mathrm{infer}} e : T
+  \quad\Longrightarrow\quad
+  \Gamma \vdash e : T.
+\]
+
+That is, every type produced by the inference judgement is accepted by the
+declarative type system.
+
+\subsection{Checked Examples}
+
+The file proves that the following program has type \texttt{int}:
+
+\[
+  \texttt{let id = fun x -> x in id 42}.
+\]
+
+\begin{lstlisting}
+Theorem id_program_sound :
+  has_type empty id_program TInt.
+\end{lstlisting}
+
+It also proves that, assuming
+\[
+  + : \texttt{int -> int -> int},
+\]
+the expression
+\[
+  \texttt{fun x -> x + 1}
+\]
+has type \texttt{int -> int}.
+
+\section{Type Safety}
+
+\subsection{Operational Semantics}
+
+\texttt{HMTypeSafety.v} defines a simply typed core language that corresponds
+to the language after type inference.  It contains integers, addition, lambda
+abstraction, application, and \texttt{let}.
+
+Values are integer literals and lambda abstractions:
+
+\begin{lstlisting}
+Inductive value : tm -> Prop :=
+| VInt : forall n, value (TIntLit n)
+| VLam : forall x T body, value (TLam x T body).
+\end{lstlisting}
+
+The one-step relation \texttt{step} is call-by-value.  Application and
+\texttt{let} reduce by substituting a closed value for a variable.
+
+\begin{lstlisting}
+Inductive step : tm -> tm -> Prop :=
+| ST_AddInts :
+    forall n m,
+      step (TAdd (TIntLit n) (TIntLit m)) (TIntLit (n + m))
+| ST_AppLam :
+    forall x T body v,
+      value v ->
+      step (TApp (TLam x T body) v) (subst x v body)
+| ST_LetValue :
+    forall x v body,
+      value v ->
+      step (TLet x v body) (subst x v body)
+| ...
+\end{lstlisting}
+
+\subsection{Substitution}
+
+Preservation relies on the usual substitution lemma:
+
+\begin{lstlisting}
+Lemma substitution_preserves_typing :
+  forall G x U t v T,
+    has_type (extend G x U) t T ->
+    has_type empty v U ->
+    has_type G (subst x v t) T.
+\end{lstlisting}
+
+It states that replacing a variable of type \texttt{U} by a closed value of type
+\texttt{U} preserves the type of the surrounding term.
+
+The file also proves canonical forms lemmas: a value of type \texttt{int} is an
+integer literal, and a value of function type is a lambda abstraction.
+
+\subsection{Progress}
+
+The progress theorem says that a closed well-typed term is not stuck:
+
+\begin{lstlisting}
+Theorem progress :
+  forall t T,
+    has_type empty t T ->
+    value t \/ exists t', step t t'.
+\end{lstlisting}
+
+Equivalently:
+
+\[
+  \emptyset \vdash t : T
+  \quad\Longrightarrow\quad
+  \mathrm{value}(t)
+  \;\lor\;
+  \exists t'.\; t \to t'.
+\]
+
+\subsection{Preservation}
+
+The preservation theorem says that one-step evaluation preserves types:
+
+\begin{lstlisting}
+Theorem preservation :
+  forall t t' T,
+    has_type empty t T ->
+    step t t' ->
+    has_type empty t' T.
+\end{lstlisting}
+
+Equivalently:
+
+\[
+  \emptyset \vdash t : T
+  \land
+  t \to t'
+  \quad\Longrightarrow\quad
+  \emptyset \vdash t' : T.
+\]
+
+Together, progress and preservation give the standard syntactic type safety
+result: closed well-typed terms do not get stuck.
+
+\section{Scope and Limitations}
+
+The mechanization is deliberately split into two layers.
+
+\begin{enumerate}
+  \item \texttt{HMSoundness.v}: HM inference rules are sound with respect to
+  declarative typing.
+  \item \texttt{HMTypeSafety.v}: the typed core language is safe with respect to
+  a call-by-value operational semantics.
+\end{enumerate}
+
+This is not a full verification of the MiniML implementation.  The following
+parts remain future work:
+
+\begin{itemize}
+  \item correctness of a concrete unification algorithm;
+  \item correctness of the occurs check;
+  \item a principal type theorem;
+  \item a direct bridge between polymorphic \texttt{let} and the runtime core;
+  \item correspondence with the SML implementation.
+\end{itemize}
+
+Nevertheless, both the inference-soundness theorem and the progress /
+preservation safety theorems are mechanically checked by Coq.
+
+\section{Verification}
+
+The proofs were checked with Coq 8.16.1:
+
+\begin{lstlisting}
+cd /home/yass/my-coq-project
+coqc HMSoundness.v
+coqc HMTypeSafety.v
+\end{lstlisting}
+
+The LaTeX report was built with:
+
+\begin{lstlisting}
+pdflatex -interaction=nonstopmode hm_safety_report.tex
+\end{lstlisting}
+
+\end{document}
