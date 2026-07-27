@@ -5,3 +5,5 @@ miniml.grm.sig
 miniml.grm.desc
 # MLton の出力
 miniml3
+# Python
+__pycache__/

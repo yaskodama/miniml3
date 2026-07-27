@@ -94,7 +94,13 @@ def binop(g: str, a: int, b: int) -> int:
     if g == "/":
         return a // b
     if g == "%":
-        return a % b
+        # meta.mml's "%" is MiniML's mod, which follows OCaml: the remainder
+        # takes the sign of the dividend.  Python's % takes the sign of the
+        # divisor, so (-7) % 3 is 2 there but -1 here.  Note that "/" stays
+        # floor division, matching MiniML's / -- the reference is inconsistent
+        # in exactly this way and the mirror has to be too.
+        r = abs(a) % abs(b)
+        return r if a >= 0 else -r
     if g == "<":
         return int(a < b)
     if g == ">":
@@ -180,6 +186,10 @@ def unp(code: Code) -> tuple[str, Code]:
         a, r2 = unp(r1)
         b, r3 = unp(r2)
         return f"(if {c} then {a} else {b})", r3
+    if g == "let":
+        a, r1 = unp(r)
+        b, r2 = unp(r1)
+        return f"(let {name} = {a} in {b})", r2
     if g == "call":
         parts = []
         rest = r
@@ -251,6 +261,46 @@ def definitions() -> Defs:
     return [d_fac, d_fib, d_gcd, d_pow]
 
 
+LET: Callable[[str], Node] = lambda x: ("let", x, 0)
+
+
+def checks() -> None:
+    """Pin the places where this mirror could drift from meta.mml.
+
+    The expected values are what ./miniml3 meta.mml actually prints.
+    """
+    value_cases: list[tuple[str, Code, int]] = [
+        ("(-7) mod 3", [op("%"), NEG, num(7), num(3)], -1),
+        ("7 mod (-3)", [op("%"), num(7), NEG, num(3)], 1),
+        ("(-7) mod (-3)", [op("%"), NEG, num(7), NEG, num(3)], -1),
+        ("(-7) / 3", [op("/"), NEG, num(7), num(3)], -3),
+        ("let x = 5 in x * x",
+         [LET("x"), num(5), op("*"), var("x"), var("x")], 25),
+        ("let a = 6 in let b = 7 in a * b",
+         [LET("a"), num(6), LET("b"), num(7), op("*"), var("a"), var("b")], 42),
+    ]
+    text_cases: list[tuple[str, Code, str]] = [
+        ("let unparses",
+         [LET("x"), num(5), op("*"), var("x"), var("x")],
+         "(let x = 5 in (x * x))"),
+    ]
+
+    print("-- agreement with meta.mml --")
+    bad = 0
+    for name, code, want in value_cases:
+        got = run([], code)
+        bad += got != want
+        print(f"  {'OK ' if got == want else 'NG '} {name:24s} = {got}"
+              + ("" if got == want else f"  (meta.mml gives {want})"))
+    for name, code, want in text_cases:
+        got = unparse(code)
+        bad += got != want
+        print(f"  {'OK ' if got == want else 'NG '} {name:24s} = {got}"
+              + ("" if got == want else f"  (meta.mml gives {want})"))
+    if bad:
+        raise SystemExit(f"{bad} case(s) disagree with meta.mml")
+
+
 def main() -> None:
     defs = definitions()
     samples: list[tuple[str, Code]] = [
@@ -270,6 +320,8 @@ def main() -> None:
     fibs = [run(defs, [call("fib", 1), num(k)]) for k in range(16)]
     print("fac 0..10     =", facs)
     print("fib 0..15     =", fibs)
+    print()
+    checks()
 
 
 if __name__ == "__main__":
