@@ -7,3 +7,5 @@
 .*.aux
 *.pdf
 __pycache__/
+*.out
+*.toc

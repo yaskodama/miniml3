@@ -8,6 +8,9 @@ This project contains Coq proofs for a small Hindley-Milner-style language.
 - `HMTypeSafety.v`: operational type safety for the typed core language, including substitution, progress, and preservation.
 - `hm_safety_report.tex`: LaTeX report source.
 - `hm_safety_report_ja.tex`: the same report in Japanese.
+- `survey_mc_typeinference.tex`: a short survey, in Japanese, of the literature
+  connecting model checking with type inference.  It is here because it ends by
+  placing these proofs in that landscape, but it is prose, not Coq.
 
 ## Verify
 
@@ -25,8 +28,9 @@ so none of them rests on an added axiom.
 ## Build Report
 
 ```sh
-pdflatex -interaction=nonstopmode hm_safety_report.tex     # run twice
-lualatex -interaction=nonstopmode hm_safety_report_ja.tex  # run twice
+pdflatex -interaction=nonstopmode hm_safety_report.tex          # run twice
+lualatex -interaction=nonstopmode hm_safety_report_ja.tex       # run twice
+lualatex -interaction=nonstopmode survey_mc_typeinference.tex   # run twice
 ```
 
 Run each twice so the cross-references settle.  The Japanese version needs
