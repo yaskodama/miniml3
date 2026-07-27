@@ -153,114 +153,198 @@ pdf.text("Coq による形式化と機械検証のレポート。前回の型推
 pdf.text("対象ファイル: HMSoundness.v / HMTypeSafety.v", font=small_font, fill=MUTED)
 
 pdf.heading("1. 目的")
-pdf.text("このレポートでは、Hindley-Milner 型システムに関する二つの性質を Coq で証明した。第一に、型推論が返した型は宣言的型付けでも正しい、という型推論の健全性である。第二に、閉じた型付き項は値であるか一歩実行でき、実行しても型が保存される、という型安全性である。")
+pdf.text("このレポートでは、Hindley-Milner 型システムに関する二つの性質を Coq で証明した。第一に、推論が返した型は宣言的型付けでも正しい、という型推論の健全性である。第二に、閉じた型付き項は値であるか一歩実行でき、実行しても型が保存される、という型安全性である。Coq の記述と対照できるよう、文法と型付け規則を明示し、証明の進み方も具体的に述べる。")
 
 pdf.heading("2. 今回の改訂で直したこと")
 pdf.text("以前の版は Hindley-Milner を名乗りながら、その中身を持っていなかった。欠陥は二つある。")
-pdf.text("第一に、具体化と一般化が退化していた。inst は量化変数を置換せず本体をそのまま返し、gen は側条件なしに任意の変数を量化できた。その結果、推論関係 hm_infer と宣言的関係 has_type は構成子ごとに完全に同型となり、健全性の定理は各構成子を相方に写すだけで成立して、何も述べていなかった。")
-pdf.text("第二に、型安全性の対象言語に多相性が無かった。型は整数型と関数型だけで型変数が存在せず、ラムダは型注釈を持ち、let も単相であった。つまり証明されていたのは、単純型付きラムダ計算に let と加算を足したものの型安全性である。")
+pdf.text("第一に、具体化と一般化が退化していた。inst (Forall xs T) T は scheme の本体をそのまま返し、gen G T (Forall xs T) は側条件なしに任意の変数を量化できた。両方が恒等写像なので、アルゴリズム的関係と宣言的関係は構成子ごとに同型となり、健全性の定理は言い換えに過ぎなかった。")
+pdf.text("第二に、型安全性の対象言語に多相性が無かった。型は int と関数型だけで型変数が存在せず、ラムダは型注釈を持ち、let も単相であった。証明されていたのは、単純型付きラムダ計算に let と加算を足したものの型安全性である。")
 
-pdf.heading("3. 型推論の健全性")
-pdf.text("具体化を本物の型代入にした。代入 s が xs の外を動かさないことを only_on で表し、具体化はその代入の適用として定義する。")
+pdf.heading("3. 型推論の健全性: 文法")
 pdf.code("""
-Definition only_on (xs : list nat) (s : tsub) : Prop :=
-  forall a, memb a xs = false -> s a = TVar a.
-
-Inductive inst : scheme -> ty -> Prop :=
-| Inst : forall xs T s,
-    only_on xs s -> inst (Sch xs T) (appT s T).
+e      ::=  x | n | \\x. e | e1 e2 | let x = e1 in e2      式
+tau    ::=  int | alpha | tau1 -> tau2                    型
+sigma  ::=  forall alpha_bar. tau                         型スキーム
+Gamma  ::=  .  |  Gamma, x : sigma                        環境
 """)
-pdf.text("一般化には Damas-Milner の側条件を入れた。環境に自由に現れる変数は量化できない。環境の自由変数を計算できるよう、環境は連想リストにしてある。")
+pdf.text("x と alpha は自然数、alpha_bar はその列である。環境は関数ではなく連想リストにした。下の側条件で使う ftv(Gamma) を計算可能にするためである。")
+pdf.text("型の自由変数 ftv は構造に沿って定める。scheme では量化された変数を除き、環境では各 scheme の和をとる。")
 pdf.code("""
-Inductive gen : env -> ty -> scheme -> Prop :=
-| Gen : forall G T xs,
-    (forall a, In a xs -> ~ In a (ftv_env G)) ->
-    gen G T (Sch xs T).
-""")
-pdf.text("この側条件は空回りしていない。環境が握っている変数の一般化が拒否されることを、次の否定的な補題で確かめた。以前の定義ではこれが導けてしまっていた。")
-pdf.code("""
-Lemma gen_rejects_env_variable :
-  ~ gen [(0, Sch [] (TVar 7))] (TVar 7) (Sch [7] (TVar 7)).
-""")
-pdf.text("宣言的体系は一般化を関係のまま持ち、側条件を満たす scheme ならどれでも許す。一方アルゴリズムはその自由を持たず、最大一般化 gen_max に確定する。したがって両者はもはや同じ規則ではなく、健全性の証明は、アルゴリズムが計算したものが宣言的体系の要求を満たすことを示す義務を負う。")
-pdf.code("""
-Lemma gen_max_ok : forall G T, gen G T (gen_max G T).
-
-Theorem hm_infer_sound :
-  forall G e T, hm_infer G e T -> has_type G e T.
-""")
-pdf.text("検証例として、forall a. a -> a という scheme が int -> int と (int -> int) -> (int -> int) という二つの異なる具体化を持つことを、代入を明示して示した。その上で let id = fun x -> x in (id id) 42 が int 型を持つことを証明している。束縛を単相にするとこのプログラムが型付かないことも、あわせて証明した。")
-
-pdf.heading("4. 型安全性")
-pdf.text("型に変数を入れ、環境を型スキームに、let を多相にした。量化変数は de Bruijn 指標 TBound とし、自由変数 TFree とは別の構成子にしてある。具体化は TBound しか触らず、代入される型には TBound が現れないので、変数捕獲が構造的に起こり得ない。新鮮性の側条件も型代入補題も不要になり、検証しきれる長さに収まった。")
-pdf.code("""
-Inductive ty : Type :=
-| TInt : ty
-| TFree : nat -> ty
-| TBound : nat -> ty
-| TArrow : ty -> ty -> ty.
-
-Inductive scheme : Type := Sch : nat -> ty -> scheme.
-""")
-pdf.text("多相 let は、束縛される式が scheme の全ての具体化で型付くことを要求する。束縛変数の各出現は、そのうち好きなものを選べる。")
-pdf.code("""
-| TyLet : forall G x e1 e2 n T0 T2,
-    (forall ts, length ts = n -> has_type G e1 (open ts T0)) ->
-    has_type (extend G x (Sch n T0)) e2 T2 ->
-    has_type G (TmLet x e1 e2) T2.
-""")
-pdf.text("代入補題も scheme に対して述べ直した。変数の位置に置く値は、その変数が束縛された scheme の全ての具体化で型付いていなければならない。ラムダ束縛ではこの仮定は一つの型に潰れ、let 束縛では TyLet の第一前提そのものになる。多相の場合が通るのはこのためである。")
-pdf.code("""
-Lemma substitution_preserves_typing :
-  forall t G x Sg v T,
-    has_type (extend G x Sg) t T ->
-    (forall T', inst Sg T' -> has_type empty v T') ->
-    has_type G (subst x v t) T.
+ftv(int)          = {}
+ftv(alpha)        = { alpha }
+ftv(t1 -> t2)     = ftv(t1) U ftv(t2)
+ftv(forall a_. t) = ftv(t) \\ a_
+ftv(Gamma)        = U { ftv(sigma) : x:sigma in Gamma }
 """)
 
-pdf.heading("5. Progress と Preservation")
-pdf.text("Progress は、閉じた型付き項が詰まらないことを述べる。Preservation は、一歩の評価が型を壊さないことを述べる。二つを合わせて、標準的な構文的型安全性が得られる。")
+pdf.heading("4. 具体化と一般化")
+pdf.text("代入 s は型変数を型へ写し、型に準同型に作用する。beta が alpha_bar に属さないとき常に s(beta) = beta であることを、s が alpha_bar の上でのみ作用する、という。")
 pdf.code("""
-Theorem progress :
-  forall t T,
-    has_type empty t T -> value t \\/ exists t', step t t'.
+      s は alpha_bar の上でのみ作用する
+  ----------------------------------------- Inst
+      forall alpha_bar. tau  <=  s(tau)
 
-Theorem preservation :
-  forall t t' T,
-    has_type empty t T -> step t t' -> has_type empty t' T.
+      alpha_bar かつ ftv(Gamma) = 空
+  ----------------------------------------- Gen
+      gen(Gamma, tau) ∋ forall alpha_bar. tau
 """)
-pdf.text("多相性が本物であることの証拠として、let id = fun x -> x in (id id) 42 がここでも型付くことを証明した。id を (int -> int) -> (int -> int) と int -> int の二つの型で使っている。前の版の単相体系ではこれは型付かないので、拡張は見かけだけのものではない。")
+pdf.text("Inst が第一の欠陥の修復である。scheme の本体が実際に置換される。ここから、単相 scheme はただ一つの具体化しか持たないことが従う。これは inst_mono_inv であり、証明は only_on_nil と appT_id から出る。")
+pdf.text("Gen が第二の欠陥の修復、すなわち Damas-Milner の側条件である。空回りしていないことは、Gamma = { x0 : alpha7 } のとき gen(Gamma, alpha7) が forall alpha7. alpha7 を含まないこと、つまり導出不能であることで確かめた。以前の定義ではこれが導けた。")
+pdf.text("アルゴリズムは Gen が許す自由を持たず、最大一般化に確定する。")
+pdf.code("""
+gen_max(Gamma, tau) = forall (ftv(tau) \\ ftv(Gamma)). tau
+""")
 
-pdf.heading("6. 一般化の二つの見方")
-pdf.text("二つのファイルは一般化を意図的に別の角度から扱っている。HMSoundness.v は構文的な Damas-Milner の側条件を使う。HMTypeSafety.v は意味論的な形、すなわち束縛される式が全ての具体化で型付くことを要求する形を使う。後者は型代入補題と新鮮性の機構なしに安全性の証明を閉じるための選択である。標準的な定式化ではあるが、構文的な Gen 規則そのものではない。")
+pdf.heading("5. 型推論の健全性: 規則")
+pdf.text("宣言的体系の規則は次のとおり。")
+pdf.code("""
+ Gamma(x) = sigma    sigma <= tau
+ -------------------------------- T-Var        --------------- T-Int
+        Gamma |- x : tau                       Gamma |- n : int
 
-pdf.heading("7. 範囲と限界")
-pdf.text("これは MiniML 実装の検証ではない。証明されたのは上の二つの Coq の体系についてであって、このリポジトリの SML コードとの隔たりは大きい。")
-pdf.text("未着手のものは、具体的な単一化アルゴリズムの正しさ、occurs check、principal type、構文的な一般化と意味論的な一般化の橋渡し、再帰、リストと組とパターン照合、そして SML 実装との対応証明である。とりわけ MiniML の中核は let rec であるが、どちらのファイルにも再帰は無いので、再帰的定義について本証明は何も述べていない。")
+    Gamma, x:tau1 |- e : tau2
+ ------------------------------------ T-Lam
+ Gamma |- \\x. e : tau1 -> tau2
 
-pdf.heading("8. 証明が覆っていない反例")
-pdf.text("MiniML は比較演算子に forall a. a * a -> bool という多相型を与えているが、関数値は実行時に比較できない。次は型検査を通ってから失敗する。")
+ Gamma |- e1 : tau1 -> tau2    Gamma |- e2 : tau1
+ ------------------------------------------------ T-App
+              Gamma |- e1 e2 : tau2
+
+ Gamma |- e1 : tau1
+ gen(Gamma, tau1) ∋ sigma
+ Gamma, x:sigma |- e2 : tau2
+ ------------------------------------------- T-Let
+ Gamma |- let x = e1 in e2 : tau2
+""")
+pdf.text("アルゴリズム的体系は、let 以外は同じ規則である。let では scheme を選ぶ自由が無く、gen_max に確定する。")
+pdf.code("""
+ Gamma |-I e1 : tau1
+ Gamma, x:gen_max(Gamma,tau1) |-I e2 : tau2
+ ------------------------------------------- I-Let
+ Gamma |-I let x = e1 in e2 : tau2
+""")
+pdf.text("T-Let は I-Let が持たない前提を一つ余分に持つ。したがって両者はもはや同じ規則ではなく、健全性には証明すべきことがある。")
+
+pdf.heading("6. 型推論の健全性: 証明の進み方")
+pdf.text("定理 hm_infer_sound は、Gamma |-I e : tau ならば Gamma |- e : tau である。証明は Gamma |-I e : tau の導出に関する帰納法で、場合は五つ。")
+pdf.text("I-Var と I-Int は即座に終わる。対応する宣言的規則の前提が同じで、具体化の前提はそのまま持ち越されるからである。I-Lam と I-App は帰納法の仮定だけで閉じる。")
+pdf.text("働きがあるのは I-Let のみである。帰納法の仮定から Gamma |- e1 : tau1 と Gamma, x:gen_max(Gamma,tau1) |- e2 : tau2 が得られる。T-Let を適用するには、その中央の前提 gen(Gamma,tau1) ∋ gen_max(Gamma,tau1) を供給しなければならない。すなわち、アルゴリズムが量化した変数がすべて本当に ftv(Gamma) に無いことである。これが補題 gen_max_ok である。")
+pdf.text("gen_max_ok の証明は次のとおり。量化される列は filter で ftv(tau) から取られている。その要素 a をとると、filter_In より述語が a について成り立つので negb (memb a ftv(Gamma)) = true、negb_true_iff より memb a ftv(Gamma) = false、memb_false_notin より a が ftv(Gamma) に属さない。これがちょうど Gen の側条件である。")
+pdf.text("実例として、forall alpha0. alpha0 -> alpha0 が二つの具体化 int -> int と (int -> int) -> (int -> int) を持つことを、代入 [alpha0 := int] と [alpha0 := int -> int] を明示して示した。これを使って let id = \\x. x in (id id) 42 が int 型を持つことを導き、定理で宣言的体系へ移している。左の id は (int -> int) -> (int -> int) で、右の id は int -> int で使われる。単相束縛ではこれが不可能であることも、inst_mono_inv から証明した。")
+
+pdf.heading("7. 型安全性: 文法")
+pdf.code("""
+t      ::=  x | n | t1 + t2 | \\x. t | t1 t2 | let x = t1 in t2   項
+v      ::=  n | \\x. t                                            値
+tau    ::=  int | alpha | #i | tau1 -> tau2                       型
+sigma  ::=  forall^n. tau                                        スキーム
+""")
+pdf.text("ラムダは型注釈を持たない。言語は型無しで、関係がそれに型を付ける。実際の HM 体系と同じ形である。")
+pdf.text("型変数は二種類ある。alpha は自由型変数 TFree、#i は囲む scheme が束縛する i 番目の変数 TBound、すなわち de Bruijn 指標である。scheme forall^n. tau は tau の中の #0 から #(n-1) を束縛する。")
+pdf.text("この二分割が、開発を短く保っている仕掛けである。具体化は #i しか置き換えず、置き換えて入る型には alpha しか現れないので、自由変数が量化子に捕獲されることが原理的に起こらない。新鮮性の側条件も型代入補題も、どこにも必要ない。")
+pdf.code("""
+open t_ int          = int
+open t_ alpha        = alpha
+open t_ #i           = tau_i        (i >= n なら #i のまま)
+open t_ (t1 -> t2)   = open t_ t1 -> open t_ t2
+
+        |t_| = n
+ ----------------------------- Inst
+ forall^n. tau  <=  open t_ tau
+""")
+pdf.text("open [] tau = tau が無条件に成り立つので、単相 scheme forall^0. tau はやはり tau ただ一つの具体化を持つ。")
+
+pdf.heading("8. 型安全性: 規則")
+pdf.code("""
+ Gamma(x) = sigma   sigma <= tau
+ ------------------------------- S-Var        --------------- S-Int
+        Gamma |- x : tau                      Gamma |- n : int
+
+ Gamma |- t1 : int   Gamma |- t2 : int
+ ------------------------------------- S-Add
+       Gamma |- t1 + t2 : int
+
+ Gamma, x:forall^0. tau1 |- t : tau2
+ ----------------------------------- S-Lam
+ Gamma |- \\x. t : tau1 -> tau2
+
+ Gamma |- t1 : tau1 -> tau2   Gamma |- t2 : tau1
+ ----------------------------------------------- S-App
+             Gamma |- t1 t2 : tau2
+
+ forall t_. |t_| = n ならば Gamma |- t1 : open t_ tau0
+ Gamma, x:forall^n. tau0 |- t2 : tau
+ ----------------------------------------------------- S-Let
+ Gamma |- let x = t1 in t2 : tau
+""")
+pdf.text("S-Let は一般化を意味論的に読んだものである。ftv(Gamma) から scheme を計算するのではなく、t1 が scheme の全ての具体化で型付くことを要求し、t2 の中の x の各出現が必要な具体化を選べるようにする。この前提は全称量化された仮定だが、Coq はこれを強正値の出現として受理し、期待どおりの帰納法の仮定を生成する。")
+pdf.text("操作意味論は値呼び、左から右である。")
+pdf.code("""
+ --------------------- E-Add        t1 -> t1'
+ n + m -> n+m                ------------------------- E-Add1
+                             t1 + t2 -> t1' + t2
+
+ t -> t'                     ------------------------------- E-Beta
+ --------------- E-Add2      (\\x. t) v -> t[x := v]
+ v + t -> v + t'
+
+ t1 -> t1'                   t -> t'
+ ------------------- E-App1  --------------- E-App2
+ t1 t2 -> t1' t2             v t -> v t'
+
+ ----------------------------- E-Let
+ let x = v in t -> t[x := v]
+
+ t1 -> t1'
+ ------------------------------------------- E-Let1
+ let x = t1 in t2 -> let x = t1' in t2
+""")
+
+pdf.heading("9. 型安全性: 証明の進み方")
+pdf.text("環境は自然数から scheme への部分関数なので、必要な四つの事実は一行ずつで済む。extend_eq、extend_neq、extend_shadow、extend_permute であり、いずれも Nat.eqb の場合分けで終わる。その上に context_invariance と weakening が乗り、どちらも型付け導出に関する帰納法である。")
+pdf.text("代入補題は scheme に対して述べる。Gamma, x:sigma |- t : tau であり、かつ sigma <= tau' なる全ての tau' について |- v : tau' であるなら、Gamma |- t[x := v] : tau である。v への仮定が、多相束縛でこの補題を働かせている。x が使われうる各具体化で v が型付いていなければならない。")
+pdf.text("証明は導出ではなく項 t に関する帰納法で進める。各場合が v への仮定を別の型で使い直せるようにするためである。場合は六つで、議論を担うのは三つ。")
+pdf.text("変数の場合。t = x なら extend_eq で束縛が sigma と分かり、型付けの前提が sigma <= tau を与え、v への仮定が |- v : tau を供給する。これを weaken_empty で Gamma へ持ち上げる。t = y かつ y と x が異なるなら、extend_neq で束縛を捨て、S-Var で導出を組み直す。")
+pdf.text("ラムダの場合。t = \\y. t' では、y = x のとき代入は止まる。この場合は extend_shadow を使った context_invariance で閉じる。内側の x の束縛が外側を隠すからである。y と x が異なるときは extend_permute で二つの束縛を入れ替え、帰納法の仮定を適用する。")
+pdf.text("let の場合。本体については同じ隠蔽と交換の場合分けをする。束縛される式については、S-Let の全称量化された前提を各 t_ で具体化し、その具体化での t1 の帰納法の仮定に渡す。")
+pdf.text("標準形の補題は、値であることと型付け導出の両方を inversion して得る。int 型の値は整数リテラル、関数型の値はラムダである。他の組み合わせは、S-Int と S-Lam が異なる型構成子を作ることから反駁される。")
+
+pdf.heading("10. Progress と Preservation")
+pdf.text("Progress は、|- t : tau ならば t が値であるか、ある t' へ一歩進むことを述べる。証明は型付け導出に関する帰納法で、環境を空として覚えておく。")
+pdf.text("S-Var は空虚である。空環境は束縛を与えないので前提が矛盾する。S-Int と S-Lam は値をそのまま与える。S-Add は、両辺が値なら標準形の補題で整数リテラルになり E-Add が発火し、そうでなければ先に進む方を E-Add1 か E-Add2 で伝播させる。S-App も同じ議論で、canonical_arrow が関数をラムダに変えるので E-Beta が使える。")
+pdf.text("S-Let では、t1 についての帰納法の仮定それ自体が t_ について全称量化されているので、使う前に具体化しなければならない。長さが合えば何でもよく、証明では repeat int n を渡している。長さが n であることは repeat_length による。これで、t1 が値なら E-Let が発火し、そうでなければ E-Let1 が伝播する。")
+pdf.text("Preservation は、|- t : tau かつ t -> t' ならば |- t' : tau を述べる。証明は step の導出に関する帰納法で、各場合において型付け導出を inversion する。合同規則は帰納法の仮定の周りに同じ規則を組み直すだけである。E-Add は S-Int で閉じる。要点は二つ。")
+pdf.text("E-Beta では、S-App と S-Lam を順に inversion して Gamma, x:forall^0. tau1 |- t : tau2 と |- v : tau1 を得る。代入補題は forall^0. tau1 の全ての具体化で v が型付くことを求めるが、inst_mono_inv より具体化は tau1 しかないので、手元の仮定で足りる。")
+pdf.text("E-Let では、S-Let を inversion すると、v が forall^n. tau0 の全ての具体化で型付くことと、Gamma, x:forall^n. tau0 |- t2 : tau が、そのまま得られる。これは代入補題の二つの仮定そのものであり、多相の場合が追加の作業なしに閉じる。S-Let を意味論的に述べたことの見返りである。")
+pdf.text("E-Let1 では束縛される式が進む。新しい S-Let の前提は、古い前提を各 t_ で具体化し、帰納法の仮定を通して得る。")
+pdf.text("実例として、id = \\x. x が forall^1. #0 -> #0 の全ての具体化で型付くことを示した。任意の tau について open [tau] (#0 -> #0) = tau -> tau であり、S-Lam に続いて inst_mono つきの S-Var を使えば |- \\x. x : tau -> tau が一般に導ける。この前提が S-Let を養い、let id = \\x. x in (id id) 42 が int 型を持つことを与える。二つの出現はそれぞれ [int -> int] と [int] で具体化される。前の版の単相体系ではこれは型付かない。")
+
+pdf.heading("11. 一般化の二つの見方")
+pdf.text("二つのファイルは一般化を意図的に別の角度から扱っている。HMSoundness.v は構文的で、側条件は alpha_bar が ftv(Gamma) と交わらないこと、量化変数は名前付き、環境は連想リスト、ftv(Gamma) を必要とする。HMTypeSafety.v は意味論的で、条件は全ての具体化で型付くこと、量化変数は de Bruijn 指標、環境は関数、ftv(Gamma) を必要としない。")
+pdf.text("意味論的な形は、型代入補題と新鮮性の機構なしに安全性の証明を閉じるための選択である。標準的な定式化ではあるが、構文的な Gen 規則そのものではない。両者を繋ぐこと、すなわち構文的な一般化が意味論的な条件を満たすことの証明は、自然な次の一歩であり、ここでは行っていない。")
+
+pdf.heading("12. 範囲と限界")
+pdf.text("これは MiniML 実装の検証ではない。証明されたのは上の二つの体系についてであって、このリポジトリの SML コードとの隔たりは大きい。")
+pdf.text("未着手のものは、具体的な単一化アルゴリズムの正しさ、occurs check、principal type、構文的な一般化と意味論的な一般化の橋渡し、再帰、リストと組とパターン照合、そして SML 実装との対応証明である。I-Lam は依然として引数型を推測し、I-App は関数が既に矢印型であることを前提にする。これは単一化が成功したときに得られる形である。とりわけ MiniML の中核は let rec であるが、どちらのファイルにも再帰は無いので、再帰的定義について本証明は何も述べていない。")
+
+pdf.heading("13. 証明が覆っていない反例")
+pdf.text("MiniML は比較演算子に forall alpha. alpha * alpha -> bool という型を与えているが、関数値は実行時に比較できない。次は型検査を通ってから失敗する。")
 pdf.code("""
 ## let f x = x;
 f : for all 'a, ('a -> 'a) = <fun>
 ## f = f;
 Runtime error: these values cannot be compared.
 """)
-pdf.text("これは現状の MiniML に対する progress の反例である。どちらの Coq ファイルにも比較演算子は無いので、どちらもこれを排除しない。各ファイルが記述している言語の範囲では、定理は成立している。MiniML を直すには、Standard ML の等価型 ''a のような仕組みを入れるか、比較を単相に戻すことになる。")
+pdf.text("これは現状の MiniML に対する progress の反例である。どちらの Coq ファイルにも比較演算子は無いので、どちらもこれを排除しない。各ファイルが記述している言語の範囲では、定理は成立している。MiniML を直すには、Standard ML の等価型のような仕組みを入れるか、比較を単相に戻すことになる。")
 
-pdf.heading("9. 検証方法")
+pdf.heading("14. 検証方法")
 pdf.text("Rocq Prover 9.1.0 で以下を実行し、どちらも終了コード 0 で成功した。From Coq が From Stdlib に置き換わった旨の deprecation 警告以外に出力は無い。Admitted も admit も Axiom も無く、38 個の証明はすべて Qed で閉じている。")
 pdf.code("""
 cd coq/hm-soundness
 coqc HMSoundness.v
 coqc HMTypeSafety.v
 """)
-pdf.text("さらに主要な定理について隠れた仮定の有無を監査した。いずれも Closed under the global context と答えるので、追加公理に依存していない。")
-pdf.code("""
-Print Assumptions hm_infer_sound.
-Print Assumptions progress.
-Print Assumptions preservation.
-""")
+pdf.text("さらに主要な定理について隠れた仮定の有無を監査した。hm_infer_sound、progress、preservation のいずれも Closed under the global context と答えるので、追加公理に依存していない。")
 
 pdf.footer()
 pdf.pages[0].save(OUT, "PDF", resolution=150.0, save_all=True, append_images=pdf.pages[1:])
