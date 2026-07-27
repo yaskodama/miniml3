@@ -1,0 +1,9 @@
+*.aux
+*.glob
+*.log
+*.vo
+*.vok
+*.vos
+.*.aux
+*.pdf
+__pycache__/
