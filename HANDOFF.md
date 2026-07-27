@@ -10,14 +10,17 @@
 | `yaskodama/miniml`  | 1996 年版 `minicaml.sml` と、拡張版 `minicaml2.sml`（Poly/ML） |
 | `yaskodama/miniml3` | 同じ言語を ML-Lex / ML-Yacc で作り直した版（MLton）。本リポジトリ |
 
-手元の作業コピー（2026-07-27 時点）
+手元の作業コピー（2026-07-28 時点。四つとも最新）
 
 | 場所 | リポジトリ | 備考 |
 |---|---|---|
 | `~/miniml`         | miniml  | 最新 |
 | `~/miniml3`        | miniml3 | 最新。ここが主な作業場所 |
-| `~/seminar/miniml` | miniml  | **5 コミット遅れ**。`git pull` で追いつく |
-| `~/seminar/miniml3`| miniml3 | 遅れている可能性あり。`git pull` |
+| `~/seminar/miniml` | miniml  | 最新 |
+| `~/seminar/miniml3`| miniml3 | 最新 |
+
+四つとも同期済み。作業場所が分かれているので、触る前に
+`git fetch && git status -sb` で確認する習慣にしておくとよい。
 
 ## 必要な道具
 
