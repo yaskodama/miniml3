@@ -37,163 +37,214 @@
 \section{Goal}
 
 This report summarizes two mechanized Coq developments about a small
-Hindley--Milner-style language.
+Hindley--Milner language.
 
 \begin{enumerate}
   \item Inference soundness: if the HM inference judgement returns a type, then
   the declarative typing judgement also assigns that type.
-  \item Type safety: a closed well-typed core term is either a value or can take
-  a step, and stepping preserves its type.
+  \item Type safety: a closed well-typed term is either a value or can take a
+  step, and stepping preserves its type.
 \end{enumerate}
 
 The first part is implemented in \texttt{HMSoundness.v}.  The second part is
 implemented in \texttt{HMTypeSafety.v}.
 
+\section{What changed in this revision}
+
+An earlier version of both files carried the Hindley--Milner name without the
+content, and this revision repairs that.  The two defects were as follows.
+
+\paragraph{Instantiation and generalization were degenerate.}
+\texttt{HMSoundness.v} declared
+
+\begin{lstlisting}
+inst (Forall xs T) T           (* instantiation returned the body unchanged *)
+gen  G T (Forall xs T)         (* generalization quantified anything at all *)
+\end{lstlisting}
+
+With instantiation the identity and generalization unconstrained, the
+algorithmic relation \texttt{hm\_infer} and the declarative relation
+\texttt{has\_type} were the same relation constructor for constructor, so the
+soundness theorem held by mapping each constructor to its twin and said
+nothing.
+
+\paragraph{The safe language had no polymorphism.}
+\texttt{HMTypeSafety.v} declared
+
+\begin{lstlisting}
+Inductive ty := TInt | TArrow : ty -> ty -> ty.
+\end{lstlisting}
+
+with no type variables at all.  Lambdas carried an explicit annotation and
+\texttt{let} was monomorphic.  What was proved was therefore the type safety of
+the simply typed lambda calculus with \texttt{let} and addition; nothing
+polymorphic occurred anywhere.
+
+Both are addressed below.
+
 \section{Inference Soundness}
 
-\subsection{Formalization}
+\subsection{Instantiation is a substitution}
 
-\texttt{HMSoundness.v} defines a small expression language with variables,
-integer literals, lambda abstraction, application, and \texttt{let}.  Types are
-integer types, type variables, and arrow types.
+Instantiation now replaces the quantified variables by types.  A substitution
+is a map from type variables to types, and \texttt{only\_on xs s} says that
+\texttt{s} moves nothing outside \texttt{xs}.
+
+\begin{lstlisting}
+Definition only_on (xs : list nat) (s : tsub) : Prop :=
+  forall a, memb a xs = false -> s a = TVar a.
+
+Inductive inst : scheme -> ty -> Prop :=
+| Inst : forall xs T s,
+    only_on xs s ->
+    inst (Sch xs T) (appT s T).
+\end{lstlisting}
+
+A monomorphic scheme therefore has exactly one instance, itself, which is the
+lemma \texttt{inst\_mono\_inv}.
+
+\subsection{Generalization carries the side condition}
+
+A variable may be quantified only if the environment does not hold it fixed.
+Environments are association lists so that the free variables of an environment
+are computable.
+
+\begin{lstlisting}
+Inductive gen : env -> ty -> scheme -> Prop :=
+| Gen : forall G T xs,
+    (forall a, In a xs -> ~ In a (ftv_env G)) ->
+    gen G T (Sch xs T).
+\end{lstlisting}
+
+The condition is not vacuous.  The file proves that a variable occurring free
+in the environment is rejected:
+
+\begin{lstlisting}
+Lemma gen_rejects_env_variable :
+  ~ gen [(0, Sch [] (TVar 7))] (TVar 7) (Sch [7] (TVar 7)).
+\end{lstlisting}
+
+Under the previous definition this was derivable.
+
+\subsection{The theorem now has an obligation}
+
+The declarative system keeps generalization relational, so any scheme meeting
+the side condition is allowed.  The algorithm does not get that freedom: it
+commits to the maximal generalization,
+
+\begin{lstlisting}
+Definition gen_max (G : env) (T : ty) : scheme :=
+  Sch (filter (fun a => negb (memb a (ftv_env G))) (ftv T)) T.
+\end{lstlisting}
+
+so the two relations are no longer the same rules, and soundness has to show
+that what the algorithm computes satisfies what the declarative system demands:
+
+\begin{lstlisting}
+Lemma gen_max_ok : forall G T, gen G T (gen_max G T).
+
+Theorem hm_infer_sound :
+  forall G e T, hm_infer G e T -> has_type G e T.
+\end{lstlisting}
+
+In mathematical notation,
+\[
+  \Gamma \vdash_{\mathrm{infer}} e : T
+  \quad\Longrightarrow\quad
+  \Gamma \vdash e : T,
+\]
+and the \texttt{let} case of the induction is discharged by
+\texttt{gen\_max\_ok}.
+
+\subsection{Checked examples}
+
+The scheme $\forall a.\,a \to a$ is shown to have two different instances,
+$\mathtt{int} \to \mathtt{int}$ and
+$(\mathtt{int} \to \mathtt{int}) \to (\mathtt{int} \to \mathtt{int})$, by
+exhibiting the substitutions.  On the strength of that,
+
+\[
+  \texttt{let id = fun x -> x in (id id) 42}
+\]
+
+is proved to have type \texttt{int}, first through the inference judgement and
+then through \texttt{hm\_infer\_sound}.  The companion lemma
+\texttt{selfapp\_needs\_polymorphism} shows the program is not typeable if the
+binding is kept monomorphic, since the two occurrences of \texttt{id} would
+have to receive the same type.
+
+\section{Type Safety}
+
+\subsection{Types, schemes, and capture}
+
+Types now have variables, and environments map to type schemes.
 
 \begin{lstlisting}
 Inductive ty : Type :=
 | TInt : ty
-| TVar : nat -> ty
+| TFree : nat -> ty      (* a free type variable *)
+| TBound : nat -> ty     (* bound by the enclosing scheme *)
 | TArrow : ty -> ty -> ty.
+
+Inductive scheme : Type := Sch : nat -> ty -> scheme.
 \end{lstlisting}
 
-The declarative typing relation is called \texttt{has\_type}.  The algorithmic
-HM inference relation is called \texttt{hm\_infer}.  Type schemes,
-instantiation, and generalization are modeled relationally.  Thus this file
-proves soundness of the inference rules with respect to declarative typing; it
-does not yet prove correctness of a concrete unification algorithm.
-
-\subsection{Main Theorem}
-
-The central theorem is:
+Quantified variables are de Bruijn indices drawn from a constructor distinct
+from free variables.  Instantiation replaces only \texttt{TBound}, and the
+types substituted in contain only \texttt{TFree}, so variable capture cannot
+arise and no freshness side conditions are needed.  This is what keeps the
+development short enough to be checked end to end.
 
 \begin{lstlisting}
-Theorem hm_infer_sound :
-  forall G e T,
-    hm_infer G e T ->
-    has_type G e T.
+Fixpoint open (ts : list ty) (T : ty) : ty := ...
+
+Inductive inst : scheme -> ty -> Prop :=
+| Inst : forall n T ts, length ts = n -> inst (Sch n T) (open ts T).
 \end{lstlisting}
 
-In mathematical notation:
+\subsection{Polymorphic let}
 
-\[
-  \Gamma \vdash_{\mathrm{infer}} e : T
-  \quad\Longrightarrow\quad
-  \Gamma \vdash e : T.
-\]
-
-That is, every type produced by the inference judgement is accepted by the
-declarative type system.
-
-\subsection{Checked Examples}
-
-The file proves that the following program has type \texttt{int}:
-
-\[
-  \texttt{let id = fun x -> x in id 42}.
-\]
+The bound expression must be typeable at every instance of the scheme, and each
+occurrence of the bound variable may pick a different one.
 
 \begin{lstlisting}
-Theorem id_program_sound :
-  has_type empty id_program TInt.
+| TyLet : forall G x e1 e2 n T0 T2,
+    (forall ts, length ts = n -> has_type G e1 (open ts T0)) ->
+    has_type (extend G x (Sch n T0)) e2 T2 ->
+    has_type G (TmLet x e1 e2) T2.
 \end{lstlisting}
 
-It also proves that, assuming
-\[
-  + : \texttt{int -> int -> int},
-\]
-the expression
-\[
-  \texttt{fun x -> x + 1}
-\]
-has type \texttt{int -> int}.
-
-\section{Type Safety}
-
-\subsection{Operational Semantics}
-
-\texttt{HMTypeSafety.v} defines a simply typed core language that corresponds
-to the language after type inference.  It contains integers, addition, lambda
-abstraction, application, and \texttt{let}.
-
-Values are integer literals and lambda abstractions:
-
-\begin{lstlisting}
-Inductive value : tm -> Prop :=
-| VInt : forall n, value (TIntLit n)
-| VLam : forall x T body, value (TLam x T body).
-\end{lstlisting}
-
-The one-step relation \texttt{step} is call-by-value.  Application and
-\texttt{let} reduce by substituting a closed value for a variable.
-
-\begin{lstlisting}
-Inductive step : tm -> tm -> Prop :=
-| ST_AddInts :
-    forall n m,
-      step (TAdd (TIntLit n) (TIntLit m)) (TIntLit (n + m))
-| ST_AppLam :
-    forall x T body v,
-      value v ->
-      step (TApp (TLam x T body) v) (subst x v body)
-| ST_LetValue :
-    forall x v body,
-      value v ->
-      step (TLet x v body) (subst x v body)
-| ...
-\end{lstlisting}
+Lambdas lost their type annotation, so the language is the untyped calculus
+typed by the relation, as in a real HM system.
 
 \subsection{Substitution}
 
-Preservation relies on the usual substitution lemma:
+The substitution lemma is now stated against a scheme: the value put in place
+of a variable must be typeable at every instance the variable was bound with.
 
 \begin{lstlisting}
 Lemma substitution_preserves_typing :
-  forall G x U t v T,
-    has_type (extend G x U) t T ->
-    has_type empty v U ->
+  forall t G x Sg v T,
+    has_type (extend G x Sg) t T ->
+    (forall T', inst Sg T' -> has_type empty v T') ->
     has_type G (subst x v t) T.
 \end{lstlisting}
 
-It states that replacing a variable of type \texttt{U} by a closed value of type
-\texttt{U} preserves the type of the surrounding term.
+For a lambda binding that hypothesis collapses to a single type, by
+\texttt{inst\_mono\_inv}.  For a \texttt{let} binding it is exactly the first
+premise of \texttt{TyLet}, which is why the polymorphic case goes through.
 
-The file also proves canonical forms lemmas: a value of type \texttt{int} is an
-integer literal, and a value of function type is a lambda abstraction.
+The file also proves the canonical forms lemmas: a value of type \texttt{int}
+is an integer literal, and a value of function type is a lambda abstraction.
 
-\subsection{Progress}
-
-The progress theorem says that a closed well-typed term is not stuck:
+\subsection{Progress and Preservation}
 
 \begin{lstlisting}
 Theorem progress :
   forall t T,
     has_type empty t T ->
     value t \/ exists t', step t t'.
-\end{lstlisting}
 
-Equivalently:
-
-\[
-  \emptyset \vdash t : T
-  \quad\Longrightarrow\quad
-  \mathrm{value}(t)
-  \;\lor\;
-  \exists t'.\; t \to t'.
-\]
-
-\subsection{Preservation}
-
-The preservation theorem says that one-step evaluation preserves types:
-
-\begin{lstlisting}
 Theorem preservation :
   forall t t' T,
     has_type empty t T ->
@@ -201,53 +252,112 @@ Theorem preservation :
     has_type empty t' T.
 \end{lstlisting}
 
-Equivalently:
-
+Equivalently,
 \[
   \emptyset \vdash t : T
-  \land
-  t \to t'
-  \quad\Longrightarrow\quad
-  \emptyset \vdash t' : T.
+  \;\Longrightarrow\;
+  \mathrm{value}(t) \lor \exists t'.\; t \to t',
+  \qquad
+  \emptyset \vdash t : T \land t \to t'
+  \;\Longrightarrow\;
+  \emptyset \vdash t' : T .
+\]
+Together they give the standard syntactic type safety result: closed well-typed
+terms do not get stuck.
+
+\subsection{The polymorphism is real}
+
+The program
+
+\[
+  \texttt{let id = fun x -> x in (id id) 42}
 \]
 
-Together, progress and preservation give the standard syntactic type safety
-result: closed well-typed terms do not get stuck.
+is proved to have type \texttt{int}, using \texttt{id} at
+$(\mathtt{int} \to \mathtt{int}) \to (\mathtt{int} \to \mathtt{int})$ and at
+$\mathtt{int} \to \mathtt{int}$.  It is not typeable under the monomorphic
+system of the previous revision, so the extension is not cosmetic.  The file
+also runs one step of it and re-types the result through
+\texttt{preservation}.
+
+\section{Two views of generalization}
+
+The two files treat generalization from the two standard angles, and the
+difference is deliberate.
+
+\begin{itemize}
+  \item \texttt{HMSoundness.v} uses the syntactic Damas--Milner side condition:
+  a variable may be quantified when it is not free in the environment.
+  \item \texttt{HMTypeSafety.v} uses the semantic form: the bound expression is
+  required to be typeable at every instance of the scheme.
+\end{itemize}
+
+The semantic form is what lets the safety proof close without a type
+substitution lemma and without freshness machinery.  It is a standard
+presentation, but it is not the syntactic \texttt{Gen} rule, and a reader after
+the syntactic rule should look at \texttt{HMSoundness.v}.
 
 \section{Scope and Limitations}
 
-The mechanization is deliberately split into two layers.
-
-\begin{enumerate}
-  \item \texttt{HMSoundness.v}: HM inference rules are sound with respect to
-  declarative typing.
-  \item \texttt{HMTypeSafety.v}: the typed core language is safe with respect to
-  a call-by-value operational semantics.
-\end{enumerate}
-
-This is not a full verification of the MiniML implementation.  The following
-parts remain future work:
+This is \emph{not} a verification of the MiniML implementation.  What is
+proved is proved about the two Coq developments described above, and the gap to
+the SML code in this repository is wide.  The following remain future work.
 
 \begin{itemize}
   \item correctness of a concrete unification algorithm;
   \item correctness of the occurs check;
   \item a principal type theorem;
-  \item a direct bridge between polymorphic \texttt{let} and the runtime core;
+  \item bridging the syntactic and the semantic accounts of generalization;
+  \item recursion: MiniML is built on \texttt{let rec}, and neither file has
+  it, so nothing here says anything about recursive definitions;
+  \item lists, pairs, and pattern matching;
   \item correspondence with the SML implementation.
 \end{itemize}
 
-Nevertheless, both the inference-soundness theorem and the progress /
-preservation safety theorems are mechanically checked by Coq.
+\subsection{A counterexample the proofs do not cover}
+
+MiniML gives the comparison operators the polymorphic type
+$\forall a.\, a \times a \to \mathtt{bool}$, but functional values cannot be
+compared at run time.  The following is accepted by the type checker and then
+fails:
+
+\begin{lstlisting}
+## let f x = x;
+f : for all 'a, ('a -> 'a) = <fun>
+## f = f;
+Runtime error: these values cannot be compared.
+\end{lstlisting}
+
+This is a counterexample to progress for MiniML as it stands.  Neither Coq file
+contains comparison operators, so neither rules it out; within the language
+each of them does describe, the theorems hold.  Repairing MiniML would mean
+introducing equality types, as Standard ML does with \texttt{''a}, or making
+comparison monomorphic again.
 
 \section{Verification}
 
-The proofs were checked with Coq 8.16.1:
+The proofs were checked with the Rocq Prover 9.1.0:
 
 \begin{lstlisting}
-cd /home/yass/my-coq-project
+cd coq/hm-soundness
 coqc HMSoundness.v
 coqc HMTypeSafety.v
 \end{lstlisting}
+
+Both compile with exit status 0 and no output beyond a deprecation warning for
+\texttt{From Coq}, which recent versions spell \texttt{From Stdlib}.  There is
+no \texttt{Admitted}, no \texttt{admit}, and no \texttt{Axiom} in either file;
+the 38 proofs are all closed with \texttt{Qed}.  The main theorems were
+additionally audited for hidden assumptions,
+
+\begin{lstlisting}
+Print Assumptions hm_infer_sound.
+Print Assumptions progress.
+Print Assumptions preservation.
+\end{lstlisting}
+
+and each answers \texttt{Closed under the global context}, so none of them
+rests on an added axiom.
 
 The LaTeX report was built with:
 

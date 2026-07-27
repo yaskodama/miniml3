@@ -5,3 +5,5 @@
 *.vok
 *.vos
 .*.aux
+*.pdf
+__pycache__/
