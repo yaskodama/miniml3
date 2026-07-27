@@ -88,10 +88,53 @@ lualatex -interaction=nonstopmode survey_mc_typeinference.tex  # 2 回
 - **Coq の証明は MiniML 実装の検証ではない。** 単一化アルゴリズム、occurs check、
   principal type、`let rec`、リスト、組、パターン照合、多相比較はいずれも対象外
 - 構文的な一般化（`HMSoundness.v`）と意味論的な一般化（`HMTypeSafety.v`）の橋渡し
-- `~/miniml/minicaml_fixed9.sml` は Poly/ML で通らない（`withtype` の中で
-  `closure` が `environment` を参照）。`run_prolog_sample.sml` が動かない原因。
-  `closure` の定義を `(string * value) list ref` と直接書けば通る
-- `prolog_sample.mml`（miniml リポジトリ）は `minicaml2` / `miniml3` では無変更で動く
+
+## 解決済み（再発したら思い出す用）
+
+- `minicaml_fixed9.sml` の `withtype` は 2026-07-28 に修正済み。`withtype` の
+  束縛どうしは SML'97 では参照し合えないので、`closure` の中の `environment` を
+  `(string * value) list ref` と展開した。これで `run_prolog_sample.sml` が動く。
+  同種の誤りは `minicaml2.sml` でも直してある
+
+## miniml リポジトリの Prolog サンプル
+
+`prolog_sample.mml`（109 行）は MiniML で書いた Prolog。単一化、変数の付け替え、
+バックトラックを含む SLD 導出が実装されている。
+
+符号化は**すべて整数**。述語 `parent`=1 / `ancestor`=2、定数 `a b c d`=1 2 3 4、
+**1000 以上が変数**。ゴールは `(述語, (引数1, 引数2))`。二項述語のみ。
+
+```prolog
+parent(a,b).  parent(b,c).  parent(c,d).
+ancestor(X,Y) :- parent(X,Y).
+ancestor(X,Y) :- parent(X,Z), ancestor(Z,Y).
+```
+
+起動は三通り、どれも同じ結果になる。
+
+```sh
+cd ~/miniml
+echo 'use "run_prolog_sample.sml";' | poly -q    # 本来のドライバ
+./minicaml2 prolog_sample.mml                    # make が必要
+~/miniml3/miniml3 prolog_sample.mml              # lex/yacc 版
+```
+
+自分の問い合わせを立てるには、プログラム定義の部分を残して末尾に足す。
+`9000` を置いた引数の答えが返る（第 1 引数でも第 2 引数でもよい）。
+
+```sml
+let ask goals = let r = solve (goals,program,nilsubst,1) in
+                match r with (false,s)->0-1 | (true,s)->answer_var s;
+ask ((1,(1,9000))::[]);      (* parent(a,X)   -> 2 = b *)
+ask ((1,(9000,4))::[]);      (* parent(X,d)   -> 3 = c *)
+ask ((2,(2,9000))::[]);      (* ancestor(b,X) -> 3 = c *)
+```
+
+見つかるのは**最初の解のみ**。全解列挙は未実装。
+
+なお `self_eval_sample.mml` は名前に反して自己評価ではない。番号で関数を選ぶ
+だけのディスパッチャで、高階関数の確認用。本物の自己記述は miniml3 側の
+`lexer.mml` / `parser.mml` / `meta.mml`。
 
 ## 検証の作法
 
