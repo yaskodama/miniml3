@@ -1,0 +1,251 @@
+(* ================================================================
+   prolog.mml -- MiniML で書いた Prolog
+   実行:  ./miniml3 prolog.mml
+
+   ~/miniml/prolog_sample.mml は述語も定数も整数で符号化し、二項述語
+   だけを扱い、最初の解しか返さなかった。ここでは
+
+     ・項を本物の複合項にする（アトム・変数・関手つき項。リストも書ける）
+     ・任意の引数個数
+     ・全解を列挙する
+
+   代数的データ型が無いので、項もこれまでと同じ前置記法の平坦なリストで
+   表す。節点は (種別, 名前, 数) の三つ組。
+
+     ("a", 名前, 0)   アトム          foo  bar  []
+     ("v", 名前, 0)   変数            X    Y
+     ("f", 関手, k)   k 引数の複合項。子が k 個続く
+
+   リスト [a,b] は "."(a, "."(b, [])) と書く。
+   ================================================================ *)
+
+(* ---------------- リストの基本 ---------------- *)
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec iter f l = match l with [] -> () | x :: r -> let u = f x in iter f r;
+let rec app a b = match a with [] -> b | x :: r -> x :: app r b;
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+let rec rev1 acc l = match l with [] -> acc | x :: r -> rev1 (x :: acc) r;
+let rev l = rev1 [] l;
+let rec takeN k l = if k <= 0 then [] else (match l with [] -> [] | x :: r -> x :: takeN (k-1) r);
+let rec joins sep l =
+  match l with [] -> "" | [x] -> x | x :: r -> x ^ sep ^ joins sep r;
+let rec concatL l = match l with [] -> [] | x :: r -> app x (concatL r);
+let say s = print_string (s ^ "\n");
+
+(* ---------------- 項の骨組み ---------------- *)
+let kindOf t = fst t;
+let namOf t = fst (snd t);
+let numOf t = snd (snd t);
+
+let tArity t = if kindOf t = "f" then numOf t else 0;
+let rec tSkipN k l =
+  if k = 0 then l else (match l with [] -> [] | t :: r -> tSkipN (k - 1 + tArity t) r);
+let tSkip1 l = tSkipN 1 l;
+let lenTerm l = length l - length (tSkip1 l);
+let headTerm l = takeN (lenTerm l) l;
+
+(* 項の組み立て *)
+let atom_ x = [("a", x, 0)];
+let var_ x  = [("v", x, 0)];
+let funA f args = app [("f", f, length args)] (concatL args);
+let nil_ = atom_ "[]";
+let cons_ h t = funA "." [h; t];
+let rec list_ xs = match xs with [] -> nil_ | x :: r -> cons_ x (list_ r);
+
+(* ---------------- 代入（束縛の表） ---------------- *)
+let rec lookupT x s =
+  match s with [] -> [] | (v, t) :: r -> (if v = x then t else lookupT x r);
+
+(* 先頭が束縛された変数なら、その束縛を辿る *)
+let rec derefT l s =
+  match l with
+    [] -> []
+  | t :: r ->
+      (if kindOf t = "v" then
+         (let b = lookupT (namOf t) s in
+          if b = [] then headTerm l else derefT b s)
+       else headTerm l);
+
+(* ---------------- 単一化 ----------------
+   相互再帰が書けないので、引数の並びを合わせる unifyN は
+   単一化関数 uf を引数で受け取る。 *)
+let rec unifyN uf k xs ys s =
+  if k = 0 then (true, s)
+  else
+    (let r = uf (headTerm xs) (headTerm ys) s in
+     if not (fst r) then (false, snd r)
+     else unifyN uf (k - 1) (tSkip1 xs) (tSkip1 ys) (snd r));
+
+let rec unify1 a b s =
+  let da = derefT a s in
+  let db = derefT b s in
+  match da with
+    [] -> (true, s)
+  | ta :: ra ->
+      (match db with
+         [] -> (true, s)
+       | tb :: rb ->
+           (if kindOf ta = "v" then
+              (if kindOf tb = "v" && namOf ta = namOf tb then (true, s)
+               else (true, (namOf ta, db) :: s))
+            else if kindOf tb = "v" then (true, (namOf tb, da) :: s)
+            else if kindOf ta = "a" && kindOf tb = "a" then (namOf ta = namOf tb, s)
+            else if kindOf ta = "f" && kindOf tb = "f"
+                    && namOf ta = namOf tb && numOf ta = numOf tb then
+              unifyN unify1 (numOf ta) ra rb s
+            else (false, s)));
+
+(* ---------------- 変数の付け替え ----------------
+   節を使うたびに、その節の変数を別名にする。名前に番号を足すだけでよい *)
+let renameT k l =
+  map (fun t -> (if kindOf t = "v" then ("v", namOf t ^ "#" ^ string_of_int k, 0) else t)) l;
+
+(* ---------------- 導出（全解を集める） ----------------
+   goals は目標の並び。program は (頭部, 本体の並び) の並び。
+   k は変数の付け替えに使う通し番号。戻り値は (解の並び, 次の番号)。
+
+   最初の解で止めず、節をすべて試して結果を連結する。これが
+   「バックトラックして次の解を探す」ことにあたる。
+   ================================================================ *)
+let rec solveAll goals program s k depth =
+  if depth <= 0 then ([], k)
+  else
+    (match goals with
+       [] -> ([s], k)
+     | g :: rest ->
+         (let rec tryC cs k2 =
+            match cs with
+              [] -> ([], k2)
+            | (h, b) :: cs2 ->
+                (let hh = renameT k2 h in
+                 let bb = map (renameT k2) b in
+                 let u = unify1 g hh s in
+                 if not (fst u) then tryC cs2 (k2 + 1)
+                 else
+                   (let a = solveAll (app bb rest) program (snd u) (k2 + 1) (depth - 1) in
+                    let c = tryC cs2 (snd a) in
+                    (app (fst a) (fst c), snd c)))
+          in tryC program k));
+
+(* ---------------- 解を項に戻す ----------------
+   代入をたどって、変数を中身で置き換えた項を作る *)
+let rec instN f k xs s =
+  if k = 0 then []
+  else app (f (headTerm xs) s) (instN f (k - 1) (tSkip1 xs) s);
+
+let rec instT l s =
+  let d = derefT l s in
+  match d with
+    [] -> []
+  | t :: r -> (if kindOf t = "f" then app [t] (instN instT (numOf t) r s) else [t]);
+
+(* ---------------- 項の表示 ----------------
+   リストは [a,b,c] の形で見せる *)
+let rec showArgs sf k l =
+  if k = 0 then ("", l)
+  else
+    (let p = sf l in
+     let q = showArgs sf (k - 1) (snd p) in
+     (fst p ^ (if k = 1 then "" else ", ") ^ fst q, snd q));
+
+let rec showListTail sf l =
+  match l with
+    [] -> ("", [])
+  | t :: r ->
+      (if kindOf t = "a" && namOf t = "[]" then ("]", r)
+       else if kindOf t = "f" && namOf t = "." && numOf t = 2 then
+         (let h = sf r in
+          let q = showListTail sf (snd h) in (", " ^ fst h ^ fst q, snd q))
+       else (let p = sf l in ("|" ^ fst p ^ "]", snd p)));
+
+let rec showT l =
+  match l with
+    [] -> ("", [])
+  | t :: r ->
+      (if kindOf t = "a" then (namOf t, r)
+       else if kindOf t = "v" then ("_" ^ namOf t, r)
+       else if namOf t = "." && numOf t = 2 then
+         (let h = showT r in
+          let q = showListTail showT (snd h) in ("[" ^ fst h ^ fst q, snd q))
+       else
+         (let p = showArgs showT (numOf t) r in (namOf t ^ "(" ^ fst p ^ ")", snd p)));
+
+let showTerm l = fst (showT l);
+
+(* ---------------- 問い合わせの入口 ---------------- *)
+let ask program goals vars =
+  let r = solveAll goals program [] 1 60 in
+  let sols = fst r in
+  let showOne s =
+    (if vars = [] then "はい"
+     else joins ", " (map (fun v -> v ^ " = " ^ showTerm (instT (var_ v) s)) vars)) in
+  (let u = say ("  ?- " ^ joins ", " (map showTerm goals)) in
+   if sols = [] then say "     いいえ（解なし）"
+   else if vars = [] then say ("     はい（導出 " ^ string_of_int (length sols) ^ " 通り）")
+   else iter (fun s -> say ("     " ^ showOne s)) sols);
+
+let askCount program goals =
+  let r = solveAll goals program [] 1 60 in
+  (let u = say ("  ?- " ^ joins ", " (map showTerm goals)) in
+   say ("     解の個数 = " ^ string_of_int (length (fst r))));
+
+(* ================================================================
+   例1: 家系図
+     parent(a,b). parent(b,c). parent(c,d). parent(b,e).
+     ancestor(X,Y) :- parent(X,Y).
+     ancestor(X,Y) :- parent(X,Z), ancestor(Z,Y).
+   ================================================================ *)
+
+let fact_ h = (h, []);
+let famiy0 = 0;
+
+let family =
+  [ fact_ (funA "parent" [atom_ "a"; atom_ "b"]);
+    fact_ (funA "parent" [atom_ "b"; atom_ "c"]);
+    fact_ (funA "parent" [atom_ "c"; atom_ "d"]);
+    fact_ (funA "parent" [atom_ "b"; atom_ "e"]);
+    (funA "ancestor" [var_ "X"; var_ "Y"],
+     [funA "parent" [var_ "X"; var_ "Y"]]);
+    (funA "ancestor" [var_ "X"; var_ "Y"],
+     [funA "parent" [var_ "X"; var_ "Z"];
+      funA "ancestor" [var_ "Z"; var_ "Y"]]) ];
+
+(* ================================================================
+   例2: リストの append と member
+     append([], L, L).
+     append([H|T], L, [H|R]) :- append(T, L, R).
+     member(X, [X|_]).
+     member(X, [_|T]) :- member(X, T).
+   ================================================================ *)
+
+let lists =
+  [ fact_ (funA "append" [nil_; var_ "L"; var_ "L"]);
+    (funA "append" [cons_ (var_ "H") (var_ "T"); var_ "L"; cons_ (var_ "H") (var_ "R")],
+     [funA "append" [var_ "T"; var_ "L"; var_ "R"]]);
+    fact_ (funA "member" [var_ "X"; cons_ (var_ "X") (var_ "Zz")]);
+    (funA "member" [var_ "X"; cons_ (var_ "Ww") (var_ "T")],
+     [funA "member" [var_ "X"; var_ "T"]]) ];
+
+(* ================================================================
+   実行
+   ================================================================ *)
+
+say "-- 例1: 家系図。全解を列挙する --";
+ask family [funA "parent" [atom_ "b"; var_ "Q"]] ["Q"];
+ask family [funA "ancestor" [atom_ "a"; var_ "Q"]] ["Q"];
+ask family [funA "ancestor" [var_ "P"; atom_ "d"]] ["P"];
+ask family [funA "ancestor" [atom_ "a"; atom_ "d"]] [];
+ask family [funA "ancestor" [atom_ "d"; atom_ "a"]] [];
+
+say "-- 例2: append。リストの分割をすべて出す --";
+ask lists [funA "append" [var_ "X"; var_ "Y"; list_ [atom_ "1"; atom_ "2"; atom_ "3"]]] ["X"; "Y"];
+
+say "-- 例2: append を前向きに使う --";
+ask lists [funA "append" [list_ [atom_ "1"; atom_ "2"]; list_ [atom_ "3"]; var_ "Z"]] ["Z"];
+
+say "-- 例2: member --";
+ask lists [funA "member" [var_ "X"; list_ [atom_ "a"; atom_ "b"; atom_ "c"]]] ["X"];
+
+say "-- 連言の問い合わせ --";
+ask lists [funA "append" [var_ "X"; var_ "Y"; list_ [atom_ "1"; atom_ "2"]];
+           funA "member" [atom_ "1"; var_ "X"]] ["X"; "Y"];

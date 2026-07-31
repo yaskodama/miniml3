@@ -146,3 +146,77 @@ ask ((2,(2,9000))::[]);      (* ancestor(b,X) -> 3 = c *)
 - Coq は `Admitted` / `admit` / `Axiom` が無いことと、
   `Print Assumptions` が `Closed under the global context` を返すことを確認する
 - push 後は **GitHub からまっさらに clone してビルドから通す**
+
+---
+
+# 2026-07-31 の作業 --- 教科書『ML 演習』第2増補版
+
+`~/yas/seminar/smlbook` の教科書を 121 頁 → **232 頁**に増補し、
+kodamay.org に公開した。そのために書いた新しいコードがこのリポジトリにある。
+
+## 何を作ったか
+
+| ファイル | 行数 | 内容 |
+|---|---|---|
+| `mlex.mml` | 769 | ML-Lex 相当の生成器（正規表現→NFA→DFA→表、開始状態あり） |
+| `myacc.mml` | 755 | ML-Yacc 相当の生成器（LALR(1)、比較用に SLR(1) も） |
+| `selfhost_tail.mml` | 217 | 自作生成器 2 つで MiniML を作る |
+| `ccomp_tail.mml` | 553 | C サブセット→スタック VM のコンパイラ＋VM |
+| `prolog.mml` | 251 | Prolog（複合項・リスト・全解列挙） |
+| `build_gen.py` / `build_all.py` | 30 | 生成器を連結して `selfhost.mml` / `ccomp.mml` を作る |
+
+走らせ方と検証結果は `README.md` の「自作の生成器と、その応用」節にある。
+
+## 教科書の側
+
+- 編集元: **`~/yas/seminar/smlbook/revised_src/`**（pLaTeX + jbook）。
+  **git 管理外**。ビルドは
+  `platex ×3 → mendex -U → dvipdfmx`（`platex smlbook.tex`）
+- 成果物: `~/yas/seminar/smlbook/smlbook_revised2.pdf`（232 頁）。
+  旧版 `smlbook_revised.pdf`（121 頁）も残してある
+- 新章: `chap4ext.tex`（第7章の増補）、`chapA`〜`chapF.tex`（第14〜19章）
+- ソースは `revised_src/src/` に**コピー**して置いてある。
+  このリポジトリを直したら **`src/` へコピーし直す**必要がある（自動同期はしていない）
+- **日本語コメント入りのコードは `listings` では行が潰れる。**
+  `fancyvrb` + `fvextra`（`breaklines`）を使うこと。マクロ `\srcfile` /
+  `\srcpart` / `term` 環境 / `\ana`（穴埋めの空欄）/ `\quiz` は
+  `smlbook.tex` のプリアンブルにある
+- ファイル名に `_` を含むものを `\srcfile` に渡すときは
+  `build\string_gen.py` のように `\string_` と書く
+
+## 公開
+
+- https://kodamay.org/smlbook.pdf を 232 頁版に差し替え済み（配信物をバイト照合で確認）
+- トップの「Texts & Courses」カードの説明も更新し、
+  `yaskodama/kodamay-org-web` に commit + push 済み（`e554dce`）
+- **PDF 本体はリポジトリに入れない**。`kodamay-org-web` の `.gitignore` の
+  方針（手作業で作成したページのみ管理し、教科書は対象外）に従った
+- ローカルの退避: `~/kodamay_org_site/kodamay.org/smlbook-v1-2026-07-14.pdf`、
+  `index-before-smlbook2.html`
+- アップロードは lftp。`~/.netrc` の s296 エントリは自動読取に失敗するので
+  パスワードを awk で取り出し、**引数ではなくコマンドファイル**（mode 600、
+  転送後に削除）に書いて `lftp -f` で渡す
+
+## 実測で分かったこと（本にも書いた）
+
+1. **自作 LALR(1) 生成器は本物の `mlyacc` と同じ表を作る。**
+   状態数 133 が一致、衝突 2 件・記号 `BAR`・還元される規則まで一致。
+   状態番号だけ違うのは探索順の差
+2. **LALR(1) は SLR(1) より本当に強い。** 関数適用の文法で
+   LALR 0 件 / SLR 3 件。衝突する 3 記号はちょうど FIRST(atexp)
+3. **手書き版と生成器版は 13 本中 12 本で出力が完全一致。**
+   `minicaml2` を `polyc` でビルドし直して diff で確認した。
+   残る 1 本の差は構文誤りの診断文言だけ
+4. **`f = f` が型検査を通って実行時に落ちる（進行定理の反例）。**
+   比較を多相にしたため。実測済み。
+   SML の等価型 `''a` を入れるか、比較を単相に戻すかの選択
+5. **この処理系の `"\r"` は復帰文字ではなく文字 `r`。** 詳細は README
+
+## 積み残し
+
+- `ccomp.mml` の `&&` `||` が**短絡評価になっていない**。
+  両辺を評価してしまう。分岐で書き直せば直る（章末問題にしてある）
+- `prolog.mml` の単一化に**出現検査が無い**。`X = f(X)` で無限項ができる
+- `selfhost` の対象言語は一階のまま。閉包を値に持てないため
+- 教科書の `revised_src/` が git 管理外。版管理するなら別途 init が要る
+- `revised_src/src/` はこのリポジトリからのコピー。同期は手作業

@@ -5,5 +5,8 @@ miniml.grm.sig
 miniml.grm.desc
 # MLton の出力
 miniml3
+# build_all.py が生成器を連結して作る合成ファイル
+selfhost.mml
+ccomp.mml
 # Python
 __pycache__/

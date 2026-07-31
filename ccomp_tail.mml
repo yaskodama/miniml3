@@ -1,0 +1,553 @@
+let say s = print_string (s ^ "\n");
+
+(* ================================================================
+   A. C の字句仕様
+   ================================================================ *)
+
+let cLexSpec =
+  "digit  = [0-9];\n" ^
+  "idfst  = [A-Za-z_];\n" ^
+  "idchar = [A-Za-z0-9_];\n" ^
+  "%%\n" ^
+  "[ \\t\\n]+  => (SKIP);\n" ^
+  "\"int\"     => (INT);\n" ^
+  "\"if\"      => (IF);\n" ^
+  "\"else\"    => (ELSE);\n" ^
+  "\"while\"   => (WHILE);\n" ^
+  "\"for\"     => (FOR);\n" ^
+  "\"return\"  => (RETURN);\n" ^
+  "\"print\"   => (PRINT);\n" ^
+  "{digit}+  => (NUM);\n" ^
+  "{idfst}{idchar}* => (ID);\n" ^
+  "\"<=\"      => (LE);\n" ^
+  "\">=\"      => (GE);\n" ^
+  "\"==\"      => (EQ);\n" ^
+  "\"!=\"      => (NE);\n" ^
+  "\"&&\"      => (ANDAND);\n" ^
+  "\"||\"      => (OROR);\n" ^
+  "\"=\"       => (ASSIGN);\n" ^
+  "\"<\"       => (LT);\n" ^
+  "\">\"       => (GT);\n" ^
+  "\"!\"       => (NOT);\n" ^
+  "\"+\"       => (PLUS);\n" ^
+  "\"-\"       => (MINUS);\n" ^
+  "\"*\"       => (TIMES);\n" ^
+  "\"/\"       => (DIVIDE);\n" ^
+  "\"%\"       => (MOD);\n" ^
+  "\"(\"       => (LPAREN);\n" ^
+  "\")\"       => (RPAREN);\n" ^
+  "\"{\"       => (LBRACE);\n" ^
+  "\"}\"       => (RBRACE);\n" ^
+  "\";\"       => (SEMI);\n" ^
+  "\",\"       => (COMMA);\n";
+
+(* ================================================================
+   B. C の文法。ぶら下がり else はわざと残してある
+   ================================================================ *)
+
+let cGrmSpec =
+  "%term INT | ID | NUM | IF | ELSE | WHILE | FOR | RETURN | PRINT\n" ^
+  "%term LPAREN | RPAREN | LBRACE | RBRACE | SEMI | COMMA | ASSIGN\n" ^
+  "%term PLUS | MINUS | TIMES | DIVIDE | MOD\n" ^
+  "%term LT | GT | LE | GE | EQ | NE | ANDAND | OROR | NOT\n" ^
+  "%nonterm prog | funcs | func | params | plist | block | stmts | stmt\n" ^
+  "%nonterm expr | oexpr | aexpr | rexpr | addexpr | mulexpr | unary | prim\n" ^
+  "%nonterm args | alist\n" ^
+  "%start prog\n" ^
+  "%%\n" ^
+  "prog : funcs ;\n" ^
+  "funcs : func | funcs func ;\n" ^
+  "func : INT ID LPAREN params RPAREN block ;\n" ^
+  "params : | plist ;\n" ^
+  "plist : INT ID | plist COMMA INT ID ;\n" ^
+  "block : LBRACE stmts RBRACE ;\n" ^
+  "stmts : | stmts stmt ;\n" ^
+  "stmt : INT ID SEMI\n" ^
+  "     | INT ID ASSIGN expr SEMI\n" ^
+  "     | ID ASSIGN expr SEMI\n" ^
+  "     | IF LPAREN expr RPAREN stmt\n" ^
+  "     | IF LPAREN expr RPAREN stmt ELSE stmt\n" ^
+  "     | WHILE LPAREN expr RPAREN stmt\n" ^
+  "     | FOR LPAREN ID ASSIGN expr SEMI expr SEMI ID ASSIGN expr RPAREN stmt\n" ^
+  "     | RETURN expr SEMI\n" ^
+  "     | PRINT LPAREN expr RPAREN SEMI\n" ^
+  "     | block\n" ^
+  "     | expr SEMI ;\n" ^
+  "expr : oexpr ;\n" ^
+  "oexpr : oexpr OROR aexpr | aexpr ;\n" ^
+  "aexpr : aexpr ANDAND rexpr | rexpr ;\n" ^
+  "rexpr : rexpr LT addexpr | rexpr GT addexpr | rexpr LE addexpr\n" ^
+  "      | rexpr GE addexpr | rexpr EQ addexpr | rexpr NE addexpr | addexpr ;\n" ^
+  "addexpr : addexpr PLUS mulexpr | addexpr MINUS mulexpr | mulexpr ;\n" ^
+  "mulexpr : mulexpr TIMES unary | mulexpr DIVIDE unary | mulexpr MOD unary | unary ;\n" ^
+  "unary : MINUS unary | NOT unary | prim ;\n" ^
+  "prim : NUM | ID | ID LPAREN args RPAREN | LPAREN expr RPAREN ;\n" ^
+  "args : | alist ;\n" ^
+  "alist : expr | alist COMMA expr ;\n";
+
+(* ================================================================
+   C. 構文木。前置記法の平坦なリスト
+   ================================================================ *)
+
+let tagOf t = fst t;
+let namOf t = fst (snd t);
+let numOf t = snd (snd t);
+
+let cArity t =
+  let g = tagOf t in
+  if g = "num" || g = "var" || g = "declz" || g = "nop" then 0
+  else if g = "neg" || g = "not" || g = "assign" || g = "decl" || g = "ret"
+          || g = "expr" || g = "print" then 1
+  else if g = "bin" || g = "while" then 2
+  else if g = "if" then 3
+  else if g = "for" then 4
+  else if g = "call" || g = "blk" || g = "prog" then numOf t
+  else if g = "fun" then numOf t + 1
+  else 0;
+
+let rec cSkipN k code =
+  if k = 0 then code
+  else (match code with [] -> [] | t :: r -> cSkipN (k - 1 + cArity t) r);
+let cSkip1 code = cSkipN 1 code;
+let rec countTrees code =
+  match code with [] -> 0 | _ :: _ -> 1 + countTrees (cSkip1 code);
+let headName v = match v with [] -> "" | t :: _ -> namOf t;
+
+(* ================================================================
+   D. 意味動作
+   ================================================================ *)
+
+let bin2 g a b = app [("bin", g, 0)] (app a b);
+
+let cAct p vals =
+  let v0 = nthD [] 0 vals in
+  let v1 = nthD [] 1 vals in
+  let v2 = nthD [] 2 vals in
+  let v3 = nthD [] 3 vals in
+  let v4 = nthD [] 4 vals in
+  let v5 = nthD [] 5 vals in
+  let v6 = nthD [] 6 vals in
+  let v8 = nthD [] 8 vals in
+  let v10 = nthD [] 10 vals in
+  let v12 = nthD [] 12 vals in
+  if p = 1 then app [("prog", "", countTrees v0)] v0
+  else if p = 3 then app v0 v1
+  else if p = 4 then app [("fun", headName v1, countTrees v3)] (app v3 v5)
+  else if p = 5 then []
+  else if p = 7 then v1
+  else if p = 8 then app v0 v3
+  else if p = 9 then app [("blk", "", countTrees v1)] v1
+  else if p = 10 then []
+  else if p = 11 then app v0 v1
+  else if p = 12 then [("declz", headName v1, 0)]
+  else if p = 13 then app [("decl", headName v1, 0)] v3
+  else if p = 14 then app [("assign", headName v0, 0)] v2
+  else if p = 15 then app [("if", "", 0)] (app v2 (app v4 [("nop", "", 0)]))
+  else if p = 16 then app [("if", "", 0)] (app v2 (app v4 v6))
+  else if p = 17 then app [("while", "", 0)] (app v2 v4)
+  else if p = 18 then
+    app [("for", "", 0)]
+      (app (app [("assign", headName v2, 0)] v4)
+           (app v6 (app (app [("assign", headName v8, 0)] v10) v12)))
+  else if p = 19 then app [("ret", "", 0)] v1
+  else if p = 20 then app [("print", "", 0)] v2
+  else if p = 22 then app [("expr", "", 0)] v0
+  else if p = 24 then bin2 "||" v0 v2
+  else if p = 26 then bin2 "&&" v0 v2
+  else if p = 28 then bin2 "<" v0 v2
+  else if p = 29 then bin2 ">" v0 v2
+  else if p = 30 then bin2 "<=" v0 v2
+  else if p = 31 then bin2 ">=" v0 v2
+  else if p = 32 then bin2 "==" v0 v2
+  else if p = 33 then bin2 "!=" v0 v2
+  else if p = 35 then bin2 "+" v0 v2
+  else if p = 36 then bin2 "-" v0 v2
+  else if p = 38 then bin2 "*" v0 v2
+  else if p = 39 then bin2 "/" v0 v2
+  else if p = 40 then bin2 "%" v0 v2
+  else if p = 42 then app [("neg", "", 0)] v1
+  else if p = 43 then app [("not", "", 0)] v1
+  else if p = 47 then app [("call", headName v0, countTrees v2)] v2
+  else if p = 48 then v1
+  else if p = 49 then []
+  else if p = 52 then app v0 v2
+  else v0;
+
+(* ================================================================
+   E. コード生成。命令は (命令名, 整数の引数, 名前) の三つ組
+   ================================================================ *)
+
+let opcodeOf g =
+  if g = "+" then "add" else if g = "-" then "sub"
+  else if g = "*" then "mul" else if g = "/" then "div"
+  else if g = "%" then "rem"
+  else if g = "<" then "lt" else if g = ">" then "gt"
+  else if g = "<=" then "le" else if g = ">=" then "ge"
+  else if g = "==" then "eq" else if g = "!=" then "ne"
+  else if g = "&&" then "and" else "or";
+
+let rec slotOf x env =
+  match env with
+    [] -> 0 - 1
+  | (n, s) :: r -> (if n = x then s else slotOf x r);
+
+(* 引数の並び。genExpr と相互再帰にできないので評価関数を引数で受け取る *)
+let rec genArgs gf env k ast =
+  if k = 0 then ([], ast)
+  else
+    (let a = gf env ast in
+     let b = genArgs gf env (k-1) (snd a) in
+     (app (fst a) (fst b), snd b));
+
+let rec genExpr env ast =
+  match ast with
+    [] -> ([], [])
+  | t :: r ->
+      (let g = tagOf t in
+       if g = "num" then ([("push", numOf t, "")], r)
+       else if g = "var" then ([("load", slotOf (namOf t) env, "")], r)
+       else if g = "neg" then
+         (let a = genExpr env r in
+          (app [("push", 0, "")] (app (fst a) [("sub", 0, "")]), snd a))
+       else if g = "not" then
+         (let a = genExpr env r in (app (fst a) [("not", 0, "")], snd a))
+       else if g = "bin" then
+         (let a = genExpr env r in
+          let b = genExpr env (snd a) in
+          (app (fst a) (app (fst b) [(opcodeOf (namOf t), 0, "")]), snd b))
+       else if g = "call" then
+         (let a = genArgs genExpr env (numOf t) r in
+          (app (fst a) [("call", numOf t, namOf t)], snd a))
+       else ([("push", 0, "")], r));
+
+let lbl n = "L" ^ string_of_int n;
+
+(* 文の並び。genStmt を引数で受け取る *)
+let rec genSeq gs k env ns lb ast =
+  if k = 0 then ([], env, ns, lb, ast)
+  else
+    (match gs env ns lb ast with
+       (c1, e1, n1, l1, r1) ->
+         (match genSeq gs (k-1) e1 n1 l1 r1 with
+            (c2, e2, n2, l2, r2) -> (app c1 c2, e2, n2, l2, r2)));
+
+let rec genStmt env ns lb ast =
+  match ast with
+    [] -> ([], env, ns, lb, [])
+  | t :: r ->
+      (let g = tagOf t in
+       if g = "nop" then ([], env, ns, lb, r)
+       else if g = "declz" then ([], app env [(namOf t, ns)], ns + 1, lb, r)
+       else if g = "decl" then
+         (let a = genExpr env r in
+          (app (fst a) [("store", ns, "")], app env [(namOf t, ns)], ns + 1, lb, snd a))
+       else if g = "assign" then
+         (let a = genExpr env r in
+          (app (fst a) [("store", slotOf (namOf t) env, "")], env, ns, lb, snd a))
+       else if g = "expr" then
+         (let a = genExpr env r in (app (fst a) [("pop", 0, "")], env, ns, lb, snd a))
+       else if g = "ret" then
+         (let a = genExpr env r in (app (fst a) [("ret", 0, "")], env, ns, lb, snd a))
+       else if g = "print" then
+         (let a = genExpr env r in (app (fst a) [("print", 0, "")], env, ns, lb, snd a))
+       else if g = "blk" then
+         (match genSeq genStmt (numOf t) env ns lb r with
+            (c, e2, n2, l2, r2) -> (c, env, n2, l2, r2))
+       else if g = "if" then
+         (let c = genExpr env r in
+          let l1 = lbl lb in
+          let l2 = lbl (lb + 1) in
+          match genStmt env ns (lb + 2) (snd c) with
+            (ct, e1, n1, b1, r1) ->
+              (match genStmt env n1 b1 r1 with
+                 (ce, e2, n2, b2, r2) ->
+                   (app (fst c)
+                      (app [("jz", 0, l1)]
+                         (app ct (app [("jmp", 0, l2); ("label", 0, l1)]
+                                    (app ce [("label", 0, l2)])))),
+                    env, n2, b2, r2)))
+       else if g = "while" then
+         (let l1 = lbl lb in
+          let l2 = lbl (lb + 1) in
+          let c = genExpr env r in
+          match genStmt env ns (lb + 2) (snd c) with
+            (cb, e1, n1, b1, r1) ->
+              (app [("label", 0, l1)]
+                 (app (fst c)
+                    (app [("jz", 0, l2)] (app cb [("jmp", 0, l1); ("label", 0, l2)]))),
+               env, n1, b1, r1))
+       else if g = "for" then
+         (let l1 = lbl lb in
+          let l2 = lbl (lb + 1) in
+          match genStmt env ns (lb + 2) r with
+            (ci, e1, n1, b1, r1) ->
+              (let cc = genExpr e1 r1 in
+               match genStmt e1 n1 b1 (snd cc) with
+                 (cs, e2, n2, b2, r2) ->
+                   (match genStmt e2 n2 b2 r2 with
+                      (cb, e3, n3, b3, r3) ->
+                        (app ci
+                           (app [("label", 0, l1)]
+                              (app (fst cc)
+                                 (app [("jz", 0, l2)]
+                                    (app cb (app cs [("jmp", 0, l1); ("label", 0, l2)]))))),
+                         env, n3, b3, r3))))
+       else ([], env, ns, lb, r));
+
+(* 仮引数の名前を k 個取り出して環境にする *)
+let rec paramEnv k ast env i =
+  if k = 0 then (env, ast, i)
+  else (match ast with
+          [] -> (env, [], i)
+        | t :: r -> paramEnv (k-1) r (app env [(namOf t, i)]) (i+1));
+
+let rec genFuncs k ast lb acc ftab =
+  if k = 0 then (acc, ftab, lb)
+  else
+    (match ast with
+       [] -> (acc, ftab, lb)
+     | t :: r ->
+         (match paramEnv (numOf t) r [] 0 with
+            (env, body, np) ->
+              (match genStmt env np lb body with
+                 (c, e2, n2, l2, rest) ->
+                   genFuncs (k-1) rest l2
+                     (app acc (app [("label", 0, "F:" ^ namOf t)]
+                                 (app c [("push", 0, ""); ("ret", 0, "")])))
+                     (app ftab [(namOf t, np)]))));
+
+(* ラベルを取り除いて番地を確定する *)
+let rec stripLabels code i acc labs =
+  match code with
+    [] -> (rev acc, labs)
+  | ins :: r ->
+      (if fst ins = "label" then stripLabels r i acc (app labs [(snd (snd ins), i)])
+       else stripLabels r (i+1) (ins :: acc) labs);
+
+let rec resolveJ code labs acc =
+  match code with
+    [] -> rev acc
+  | (op, a, nm) :: r ->
+      (if op = "jmp" || op = "jz" then
+         resolveJ r labs ((op, lookupS nm (0 - 1) labs, nm) :: acc)
+       else if op = "call" then
+         resolveJ r labs ((op, a, nm) :: acc)
+       else resolveJ r labs ((op, a, nm) :: acc));
+
+let compile ast =
+  match ast with
+    [] -> ([], [], [])
+  | t :: r ->
+      (match genFuncs (numOf t) r 0 [] [] with
+         (code, ftab, lb) ->
+           (let pre = [("call", 0, "main"); ("halt", 0, "")] in
+            match stripLabels (app pre code) 0 [] [] with
+              (c2, labs) ->
+                (resolveJ c2 labs [], ftab,
+                 map (fun f -> (fst f, lookupS ("F:" ^ fst f) (0 - 1) labs)) ftab)));
+
+(* ================================================================
+   F. スタック仮想機械
+   ================================================================ *)
+
+let doBin op a b =
+  if op = "add" then a + b
+  else if op = "sub" then a - b
+  else if op = "mul" then a * b
+  else if op = "div" then a / b
+  else if op = "rem" then a mod b
+  else if op = "lt" then (if a < b then 1 else 0)
+  else if op = "gt" then (if a > b then 1 else 0)
+  else if op = "le" then (if a <= b then 1 else 0)
+  else if op = "ge" then (if a >= b then 1 else 0)
+  else if op = "eq" then (if a = b then 1 else 0)
+  else if op = "ne" then (if a <> b then 1 else 0)
+  else if op = "and" then (if a <> 0 && b <> 0 then 1 else 0)
+  else (if a <> 0 || b <> 0 then 1 else 0);
+
+let rec popN k st acc =
+  if k = 0 then (acc, st)
+  else (match st with [] -> (acc, []) | v :: r -> popN (k-1) r (v :: acc));
+
+let rec bindArgs vs i env =
+  match vs with [] -> env | v :: r -> bindArgs r (i+1) (app env [(i, v)]);
+
+let rec setLocal i v env =
+  match env with
+    [] -> [(i, v)]
+  | (j, w) :: r -> (if j = i then (i, v) :: r else (j, w) :: setLocal i v r);
+
+let rec vmRun code ents pc st frames out fuel =
+  if fuel <= 0 then (out ^ "  （命令数の上限に達しました）\n", 0)
+  else
+    (match nthD ("halt", 0, "") pc code with
+       (op, a, nm) ->
+         if op = "halt" then (out, (match st with [] -> 0 | v :: _ -> v))
+         else if op = "push" then vmRun code ents (pc+1) (a :: st) frames out (fuel-1)
+         else if op = "pop" then
+           vmRun code ents (pc+1) (match st with [] -> [] | _ :: r -> r) frames out (fuel-1)
+         else if op = "load" then
+           (let loc = (match frames with [] -> [] | (rp, l) :: _ -> l) in
+            vmRun code ents (pc+1) (lookupS a 0 loc :: st) frames out (fuel-1))
+         else if op = "store" then
+           (match st with
+              [] -> (out ^ "  スタックが空\n", 0)
+            | v :: r ->
+                (match frames with
+                   [] -> (out ^ "  フレームが無い\n", 0)
+                 | (rp, l) :: fr ->
+                     vmRun code ents (pc+1) r ((rp, setLocal a v l) :: fr) out (fuel-1)))
+         else if op = "not" then
+           (match st with
+              [] -> (out ^ "  スタックが空\n", 0)
+            | v :: r -> vmRun code ents (pc+1) ((if v = 0 then 1 else 0) :: r) frames out (fuel-1))
+         else if op = "jmp" then vmRun code ents a st frames out (fuel-1)
+         else if op = "jz" then
+           (match st with
+              [] -> (out ^ "  スタックが空\n", 0)
+            | v :: r -> vmRun code ents (if v = 0 then a else pc+1) r frames out (fuel-1))
+         else if op = "call" then
+           (match popN a st [] with
+              (vs, st2) ->
+                (let e = lookupS nm (0 - 1) ents in
+                 if e < 0 then (out ^ "  未定義の関数 " ^ nm ^ "\n", 0)
+                 else vmRun code ents e st2 ((pc+1, bindArgs vs 0 []) :: frames) out (fuel-1)))
+         else if op = "ret" then
+           (match frames with
+              [] -> (out, (match st with [] -> 0 | v :: _ -> v))
+            | (rp, l) :: fr -> vmRun code ents rp st fr out (fuel-1))
+         else if op = "print" then
+           (match st with
+              [] -> (out ^ "  スタックが空\n", 0)
+            | v :: r ->
+                vmRun code ents (pc+1) r frames (out ^ "  " ^ string_of_int v ^ "\n") (fuel-1))
+         else
+           (match st with
+              [] -> (out ^ "  スタックが空\n", 0)
+            | b :: st1 ->
+                (match st1 with
+                   [] -> (out ^ "  スタックが足りない\n", 0)
+                 | c :: st2 ->
+                     vmRun code ents (pc+1) (doBin op c b :: st2) frames out (fuel-1))));
+
+(* ================================================================
+   G. 原文から実行まで
+   ================================================================ *)
+
+let rec toIntFrom s i n acc =
+  if i >= n then acc else toIntFrom s (i+1) n (acc * 10 + (ord (sub s i) - 48));
+let toInt s = toIntFrom s 0 (size s) 0;
+
+let rec toksLoop tbl ac acts src pos n out =
+  if pos >= n then rev out
+  else
+    (match scanOne tbl ac src pos n with
+       (r, np) ->
+         if r < 0 then rev (("ERR", substr src pos (pos+1)) :: out)
+         else
+           (let nm = nthD "" r acts in
+            let text = substr src pos np in
+            let np2 = (if np <= pos then pos + 1 else np) in
+            toksLoop tbl ac acts src np2 n (if nm = "SKIP" then out else (nm, text) :: out)));
+
+let ctk p =
+  (if fst p = "NUM" then ("NUM", [("num", "", toInt (snd p))])
+   else if fst p = "ID" then ("ID", [("var", snd p, 0)])
+   else (fst p, []));
+
+let showIns i ins =
+  let op = fst ins in
+  let a = fst (snd ins) in
+  let nm = snd (snd ins) in
+  "    " ^ string_of_int i ^ ": " ^ op ^
+  (if op = "push" || op = "load" || op = "store" then " " ^ string_of_int a
+   else if op = "jmp" || op = "jz" then " " ^ string_of_int a ^ "   (" ^ nm ^ ")"
+   else if op = "call" then " " ^ nm ^ "   (引数 " ^ string_of_int a ^ " 個)"
+   else "");
+
+let rec showCode i code k =
+  if k <= 0 then ()
+  else (match code with
+          [] -> ()
+        | ins :: r -> (let u = say (showIns i ins) in showCode (i+1) r (k-1)));
+
+(* ================================================================
+   H. 動かす
+   ================================================================ *)
+
+let cSrc =
+  "int fact(int n) {\n" ^
+  "  if (n <= 1) return 1; else return n * fact(n - 1);\n" ^
+  "}\n" ^
+  "int fib(int n) {\n" ^
+  "  if (n < 2) return n;\n" ^
+  "  return fib(n - 1) + fib(n - 2);\n" ^
+  "}\n" ^
+  "int gcd(int a, int b) {\n" ^
+  "  while (b != 0) { int t = a % b; a = b; b = t; }\n" ^
+  "  return a;\n" ^
+  "}\n" ^
+  "int sumto(int n) {\n" ^
+  "  int s = 0;\n" ^
+  "  for (i = 1; i <= n; i = i + 1) { s = s + i; }\n" ^
+  "  return s;\n" ^
+  "}\n" ^
+  "int isprime(int n) {\n" ^
+  "  int d = 2;\n" ^
+  "  if (n < 2) return 0;\n" ^
+  "  while (d * d <= n) { if (n % d == 0) return 0; d = d + 1; }\n" ^
+  "  return 1;\n" ^
+  "}\n" ^
+  "int countprimes(int n) {\n" ^
+  "  int c = 0;\n" ^
+  "  for (i = 2; i <= n; i = i + 1) { if (isprime(i)) c = c + 1; }\n" ^
+  "  return c;\n" ^
+  "}\n" ^
+  "int main() {\n" ^
+  "  print(fact(10));\n" ^
+  "  print(fib(15));\n" ^
+  "  print(gcd(1071, 462));\n" ^
+  "  print(sumto(100));\n" ^
+  "  print(countprimes(100));\n" ^
+  "  print(-3 + 10 * 2);\n" ^
+  "  print(!0 && 1 || 0);\n" ^
+  "  return 0;\n" ^
+  "}\n";
+
+let go u =
+  let lh = readHead [] [] (explode cLexSpec) in
+  let lrules = readRules (fst (snd lh)) [] (snd (snd lh)) in
+  let lpairs = map (fun x -> (fst (snd x), snd (snd x))) lrules in
+  match makeDFA lpairs with
+    (ltbl, lacc, ln) ->
+      (let lacts = map snd lpairs in
+       let u1 = say ("  字句: 規則 " ^ string_of_int (length lpairs)
+                     ^ " 本 -> DFA 状態 " ^ string_of_int ln) in
+       match generate cGrmSpec with
+         (prods, ts, nts, acts, gt, nstates, msgs) ->
+           (let u2 = say ("  構文: 規則 " ^ string_of_int (length prods)
+                          ^ " 本 -> LR(0) 状態 " ^ string_of_int nstates) in
+            let u3 = say ("  衝突: " ^ string_of_int (length msgs) ^ " 件"
+                          ^ (if msgs = [] then "" else "（ぶら下がり else。shift を採るので内側の if に付く）")) in
+            let u4 = iter (fun m -> say ("    " ^ m)) msgs in
+            let tokens = map ctk (toksLoop ltbl lacc lacts cSrc 0 (size cSrc) []) in
+            let u5 = say ("  記号の総数 = " ^ string_of_int (length tokens)) in
+            match parseWith prods cAct acts gt tokens with
+              (st, ast) ->
+                (if not (st = "ok") then say ("  構文誤り: " ^ st)
+                 else
+                   (let u6 = say ("  構文木の節点数 = " ^ string_of_int (length ast)) in
+                    match compile ast with
+                      (code, ftab, ents) ->
+                        (let u7 = say ("  生成した命令数 = " ^ string_of_int (length code)) in
+                         let u8 = say ("  関数の入口 = "
+                                       ^ joins ", " (map (fun e -> fst e ^ "@" ^ string_of_int (snd e)) ents)) in
+                         let u9 = say "  -- 先頭 20 命令 --" in
+                         let u10 = showCode 0 code 20 in
+                         let u11 = say "  -- 実行 --" in
+                         match vmRun code ents 0 [] [] "" 20000000 with
+                           (out, v) -> (let u12 = print_string out in
+                                        say ("  main の戻り値 = " ^ string_of_int v)))))));
+
+say "-- MiniML で書いた C コンパイラとスタック仮想機械 --";
+go ();

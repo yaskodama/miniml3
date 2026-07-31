@@ -1,0 +1,769 @@
+(* ================================================================
+   mlex.mml -- MiniML で書いた ML-Lex 相当の字句解析器生成器
+   実行:  ./miniml3 mlex.mml
+
+   仕様を読んで、正規表現 -> NFA(Thompson 構成) -> DFA(部分集合構成)
+   -> 遷移表 を作る。表は駆動部（ドライバ）が解釈して字句解析を行う。
+
+   ML-Lex と同じく開始状態を持つ。入れ子コメントは正規言語ではないので、
+   ML-Lex も開始状態と深さの数え上げで処理している（miniml.lex の
+   %s COMMENT と depth を見よ）。ここでも同じ構えを取る。ただし参照が
+   無いので、駆動部が状態を引数で持ち回る。
+
+   仕様の書き方
+
+     %s COMMENT STR;          -- 追加の開始状態（INITIAL は既定）
+     digit = [0-9];           -- 定義
+     %%
+     <INITIAL>{digit}+ => (NUM);
+     <COMMENT>.        => (SKIP);
+
+   構文木は代数的データ型が無いので前置記法の平坦なリストで表す。
+   節点は (種別, 文字面, 数) の三つ組。
+     ("chr",c,0) ("set",cs,0) ("nset",cs,0)
+     ("cat","",0) ("alt","",0) ("star","",0) ("eps","",0)
+   ================================================================ *)
+
+(* ---------------- リストの基本 ---------------- *)
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec iter f l = match l with [] -> () | x :: r -> let u = f x in iter f r;
+let rec app a b = match a with [] -> b | x :: r -> x :: app r b;
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+let rec rev1 acc l = match l with [] -> acc | x :: r -> rev1 (x :: acc) r;
+let rev l = rev1 [] l;
+let rec filter p l =
+  match l with [] -> [] | x :: r -> (if p x then x :: filter p r else filter p r);
+let rec joins sep l =
+  match l with [] -> "" | [x] -> x | x :: r -> x ^ sep ^ joins sep r;
+let rec lookupS k d l =
+  match l with [] -> d | (a, b) :: r -> (if a = k then b else lookupS k d r);
+let rec memL x l = match l with [] -> false | y :: r -> x = y || memL x r;
+(* 既定値を引数で受け取る。既定を [] に固定すると要素の型がリストに
+   決まってしまい、整数のリストにも文字列のリストにも使えなくなる *)
+let rec nthD d i l = match l with [] -> d | x :: r -> (if i <= 0 then x else nthD d (i-1) r);
+let rec idxFrom x l i =
+  match l with [] -> 0 - 1 | y :: r -> (if x = y then i else idxFrom x r (i+1));
+let indexOf x l = idxFrom x l 0;
+
+(* 整列した整数リスト。DFA の状態はこの形で表すので、= がそのまま
+   集合の同値判定になる *)
+let rec insSorted x l =
+  match l with
+    [] -> [x]
+  | y :: r -> (if x = y then l else if x < y then x :: l else y :: insSorted x r);
+let rec unionSorted a b = match a with [] -> b | x :: r -> unionSorted r (insSorted x b);
+
+(* ---------------- 文字 ---------------- *)
+let isDigit c = c >= "0" && c <= "9";
+let isLower c = c >= "a" && c <= "z";
+let isUpper c = c >= "A" && c <= "Z";
+let isAlpha c = isLower c || isUpper c;
+(* この処理系の文字列は \n \t \\ \" のみを解釈し、他の \c は c になる。
+   よって "\r" は復帰文字ではなく文字 r なので、chr 13 と書く *)
+let cr = chr 13;
+let isSpace c = c = " " || c = "\t" || c = "\n" || c = cr;
+
+let rec inSetFrom cs i n c =
+  if i >= n then false else if sub cs i = c then true else inSetFrom cs (i+1) n c;
+let inSet cs c = inSetFrom cs 0 (size cs) c;
+
+let rec rangeFrom i j = if i > j then "" else chr i ^ rangeFrom (i+1) j;
+let charRange a b = rangeFrom (ord a) (ord b);
+
+let addChar cs c = if inSet cs c then cs else cs ^ c;
+let rec unionFrom a b i n =
+  if i >= n then a else unionFrom (addChar a (sub b i)) b (i+1) n;
+let unionChars a b = unionFrom a b 0 (size b);
+
+(* 考える文字の全体。印字可能文字とタブ・改行 *)
+let univSet = rangeFrom 1 255;
+(* . が受理する集合。改行だけ含めない *)
+let rec exceptNL i n acc =
+  if i > n then acc else exceptNL (i+1) n (if chr i = "\n" then acc else acc ^ chr i);
+let dotSet = exceptNL 1 255 "";
+
+let rec complFrom u cs i n acc =
+  if i >= n then acc
+  else complFrom u cs (i+1) n (if inSet cs (sub u i) then acc else acc ^ sub u i);
+let complement cs = complFrom univSet cs 0 (size univSet) "";
+
+(* ================================================================
+   1. 正規表現の構文解析
+   ================================================================ *)
+
+let unesc c =
+  if c = "n" then "\n" else if c = "t" then "\t" else if c = "r" then cr else c;
+
+let rec scanSetBody acc cs =
+  match cs with
+    [] -> (acc, [])
+  | c :: r ->
+      if c = "]" then (acc, r)
+      else if c = "\\" then
+        (match r with [] -> (acc, []) | e :: r2 -> scanSetBody (addChar acc (unesc e)) r2)
+      else
+        (match r with
+           [] -> (addChar acc c, [])
+         | d :: r2 ->
+             if d = "-" then
+               (match r2 with
+                  [] -> (addChar (addChar acc c) d, [])
+                | e :: r3 ->
+                    (if e = "]" then (addChar (addChar acc c) d, r3)
+                     else scanSetBody (unionChars acc (charRange c e)) r3))
+             else scanSetBody (addChar acc c) r);
+
+let scanSet cs =
+  match cs with
+    [] -> (false, "", [])
+  | c :: r ->
+      (if c = "^" then (let p = scanSetBody "" r in (true, fst p, snd p))
+       else (let p = scanSetBody "" cs in (false, fst p, snd p)));
+
+let rec scanName acc cs =
+  match cs with [] -> (acc, []) | c :: r -> (if c = "}" then (acc, r) else scanName (acc ^ c) r);
+
+let rec scanQuoted acc cs =
+  match cs with
+    [] -> (rev acc, [])
+  | c :: r ->
+      if c = "\"" then (rev acc, r)
+      else if c = "\\" then
+        (match r with [] -> (rev acc, []) | e :: r2 -> scanQuoted (unesc e :: acc) r2)
+      else scanQuoted (c :: acc) r;
+
+let rec catChars l =
+  match l with
+    [] -> [("eps", "", 0)]
+  | [c] -> [("chr", c, 0)]
+  | c :: r -> ("cat", "", 0) :: ("chr", c, 0) :: catChars r;
+
+let rec pAtom defs pE cs =
+  match cs with
+    [] -> ([("eps", "", 0)], [])
+  | c :: r ->
+      if c = "(" then
+        (let p = pE defs r in
+         match snd p with
+           [] -> (fst p, [])
+         | d :: r2 -> (if d = ")" then (fst p, r2) else (fst p, snd p)))
+      else if c = "[" then
+        (let p = scanSet r in
+         ([((if fst p then "nset" else "set"), fst (snd p), 0)], snd (snd p)))
+      else if c = "." then ([("set", dotSet, 0)], r)
+      else if c = "\\" then
+        (match r with
+           [] -> ([("eps", "", 0)], [])
+         | e :: r2 -> ([("chr", unesc e, 0)], r2))
+      else if c = "\"" then (let p = scanQuoted [] r in (catChars (fst p), snd p))
+      else if c = "{" then
+        (let p = scanName "" r in (lookupS (fst p) [("eps", "", 0)] defs, snd p))
+      else ([("chr", c, 0)], r);
+
+let rec pRepLoop t cs =
+  match cs with
+    [] -> (t, [])
+  | c :: r ->
+      if c = "*" then pRepLoop (("star", "", 0) :: t) r
+      else if c = "+" then pRepLoop (app (("cat", "", 0) :: t) (("star", "", 0) :: t)) r
+      else if c = "?" then pRepLoop (app (("alt", "", 0) :: t) [("eps", "", 0)]) r
+      else (t, cs);
+
+let pRep defs pE cs = let p = pAtom defs pE cs in pRepLoop (fst p) (snd p);
+
+let startsAtom c = not (c = ")" || c = "|" || c = "*" || c = "+" || c = "?");
+
+let rec pCatLoop defs pE acc cs =
+  match cs with
+    [] -> (acc, [])
+  | c :: r ->
+      (if startsAtom c then
+         (let p = pRep defs pE cs in
+          pCatLoop defs pE (app (("cat", "", 0) :: acc) (fst p)) (snd p))
+       else (acc, cs));
+
+let pCat defs pE cs =
+  match cs with
+    [] -> ([("eps", "", 0)], [])
+  | c :: r ->
+      (if startsAtom c then (let p = pRep defs pE cs in pCatLoop defs pE (fst p) (snd p))
+       else ([("eps", "", 0)], cs));
+
+let rec pAltLoop defs pE acc cs =
+  match cs with
+    [] -> (acc, [])
+  | c :: r ->
+      (if c = "|" then
+         (let p = pCat defs pE r in
+          pAltLoop defs pE (app (("alt", "", 0) :: acc) (fst p)) (snd p))
+       else (acc, cs));
+
+let pAlt defs pE cs = let p = pCat defs pE cs in pAltLoop defs pE (fst p) (snd p);
+let rec pRegexTop defs cs = pAlt defs pRegexTop cs;
+let parseRegex defs s = fst (pRegexTop defs (explode s));
+
+let rec showNode t =
+  match t with
+    [] -> ("", [])
+  | (k, s, n) :: r ->
+      if k = "chr" then (s, r)
+      else if k = "eps" then ("()", r)
+      else if k = "set" then ("[" ^ s ^ "]", r)
+      else if k = "nset" then ("[^" ^ s ^ "]", r)
+      else if k = "star" then (let p = showNode r in ("(" ^ fst p ^ ")*", snd p))
+      else if k = "cat" then
+        (let p = showNode r in let q = showNode (snd p) in (fst p ^ fst q, snd q))
+      else if k = "alt" then
+        (let p = showNode r in let q = showNode (snd p) in ("(" ^ fst p ^ "|" ^ fst q ^ ")", snd q))
+      else ("?", r);
+let showRe t = fst (showNode t);
+
+(* ================================================================
+   2. 仕様の読み取り
+   ================================================================ *)
+
+let rec dropSpace cs =
+  match cs with [] -> [] | c :: r -> (if isSpace c then dropSpace r else cs);
+let rec dropTailSpace l =
+  match rev l with [] -> [] | c :: r -> (if isSpace c then dropTailSpace (rev r) else l);
+let trimS s = implode (dropTailSpace (dropSpace (explode s)));
+let dropHead l = match l with [] -> [] | c :: r -> (if c = "(" then r else l);
+let dropLast l = match rev l with [] -> [] | c :: r -> (if c = ")" then rev r else l);
+let cleanAct s = trimS (implode (dropLast (dropHead (explode (trimS s)))));
+
+let rec scanBracket acc cs =
+  match cs with
+    [] -> (acc, [])
+  | c :: r ->
+      if c = "]" then ("]" :: acc, r)
+      else if c = "\\" then
+        (match r with [] -> (acc, []) | e :: r2 -> scanBracket (e :: "\\" :: acc) r2)
+      else scanBracket (c :: acc) r;
+
+let rec scanQuote acc cs =
+  match cs with
+    [] -> (acc, [])
+  | c :: r ->
+      if c = "\"" then ("\"" :: acc, r)
+      else if c = "\\" then
+        (match r with [] -> (acc, []) | e :: r2 -> scanQuote (e :: "\\" :: acc) r2)
+      else scanQuote (c :: acc) r;
+
+let rec scanUntil stop1 stop2 acc cs =
+  match cs with
+    [] -> (rev acc, [])
+  | c :: r ->
+      if c = "[" then
+        (let p = scanBracket ("[" :: acc) r in scanUntil stop1 stop2 (fst p) (snd p))
+      else if c = "\"" then
+        (let p = scanQuote ("\"" :: acc) r in scanUntil stop1 stop2 (fst p) (snd p))
+      else if c = "\\" then
+        (match r with
+           [] -> (rev acc, [])
+         | e :: r2 -> scanUntil stop1 stop2 (e :: "\\" :: acc) r2)
+      else if c = stop1 then
+        (if stop2 = "" then (rev acc, r)
+         else
+           match r with
+             [] -> (rev acc, [])
+           | d :: r2 -> (if d = stop2 then (rev acc, r2) else scanUntil stop1 stop2 (c :: acc) r))
+      else scanUntil stop1 stop2 (c :: acc) r;
+
+let isSep cs =
+  match cs with
+    [] -> false
+  | a :: r -> (match r with [] -> false | b :: _ -> a = "%" && b = "%");
+let dropSep cs =
+  match cs with [] -> [] | _ :: r -> (match r with [] -> [] | _ :: r2 -> r2);
+
+(* 空白で区切られた名前の並び *)
+let rec splitWords acc cur cs =
+  match cs with
+    [] -> (if cur = "" then rev acc else rev (cur :: acc))
+  | c :: r ->
+      (if isSpace c then splitWords (if cur = "" then acc else cur :: acc) "" r
+       else splitWords acc (cur ^ c) r);
+
+(* 前置き（%s 宣言と定義）を読む。(開始状態, 定義, 残り) *)
+let rec readHead sts defs cs =
+  let cs2 = dropSpace cs in
+  if cs2 = [] then (sts, defs, [])
+  else if isSep cs2 then (sts, defs, dropSep cs2)
+  else
+    (match cs2 with
+       [] -> (sts, defs, [])
+     | c :: r ->
+         if c = "%" then
+           (* %s NAME NAME ...; *)
+           (let p = scanUntil ";" "" [] r in
+            let ws = splitWords [] "" (fst p) in
+            readHead (app sts (match ws with [] -> [] | _ :: t -> t)) defs (snd p))
+         else
+           (let p = scanUntil "=" "" [] cs2 in
+            let name = trimS (implode (fst p)) in
+            let q = scanUntil ";" "" [] (snd p) in
+            let body = trimS (implode (fst q)) in
+            readHead sts (app defs [(name, parseRegex defs body)]) (snd q)));
+
+(* 規則を読む。各規則は (開始状態, 構文木, 動作名) *)
+let rec readRules defs acc cs =
+  let cs2 = dropSpace cs in
+  if cs2 = [] then rev acc
+  else
+    (match cs2 with
+       [] -> rev acc
+     | c :: r ->
+         let sc = (if c = "<" then scanUntil ">" "" [] r else ([], cs2)) in
+         let st = (if c = "<" then trimS (implode (fst sc)) else "INITIAL") in
+         let rest0 = snd sc in
+         let p = scanUntil "=" ">" [] rest0 in
+         let re = trimS (implode (fst p)) in
+         let q = scanUntil ";" "" [] (snd p) in
+         let act = cleanAct (implode (fst q)) in
+         readRules defs ((st, parseRegex defs re, act) :: acc) (snd q));
+
+(* ================================================================
+   3. Thompson 構成で NFA を作る
+
+   遷移は (from, ラベル, to)。ラベルが "" なら イプシロン、
+   そうでなければ「その文字集合に属する 1 文字」を表す。
+   build は (開始, 受理, 遷移, 残りの木, 次の番号) を返す。
+   ================================================================ *)
+
+let rec build t k =
+  match t with
+    [] -> (k, k+1, [(k, "", k+1)], [], k+2)
+  | (kind, s, n) :: r ->
+      if kind = "chr" then (k, k+1, [(k, s, k+1)], r, k+2)
+      else if kind = "set" then (k, k+1, [(k, s, k+1)], r, k+2)
+      else if kind = "nset" then (k, k+1, [(k, complement s, k+1)], r, k+2)
+      else if kind = "eps" then (k, k+1, [(k, "", k+1)], r, k+2)
+      else if kind = "star" then
+        (match build r k with
+           (s1, a1, t1, r1, k1) ->
+             (k1, k1+1,
+              app t1 [(k1, "", s1); (a1, "", k1+1); (k1, "", k1+1); (a1, "", s1)],
+              r1, k1+2))
+      else if kind = "cat" then
+        (match build r k with
+           (s1, a1, t1, r1, k1) ->
+             (match build r1 k1 with
+                (s2, a2, t2, r2, k2) ->
+                  (s1, a2, app t1 (app t2 [(a1, "", s2)]), r2, k2)))
+      else if kind = "alt" then
+        (match build r k with
+           (s1, a1, t1, r1, k1) ->
+             (match build r1 k1 with
+                (s2, a2, t2, r2, k2) ->
+                  (k2, k2+1,
+                   app t1 (app t2 [(k2, "", s1); (k2, "", s2); (a1, "", k2+1); (a2, "", k2+1)]),
+                   r2, k2+2)))
+      else (k, k+1, [(k, "", k+1)], r, k+2);
+
+(* ある開始状態に属する規則だけを集め、1 つの NFA にまとめる。
+   戻り値は (開始状態番号, 遷移, 受理表, 次の番号)。
+   受理表は (NFA 状態, 規則番号)。規則番号が小さいほど優先する。 *)
+let rec buildAllFrom rules i start trans accs k =
+  match rules with
+    [] -> (start, trans, accs, k)
+  | (tree, _) :: r ->
+      (match build tree k with
+         (s1, a1, t1, _, k1) ->
+           buildAllFrom r (i+1) start
+             (app trans (app t1 [(start, "", s1)])) (app accs [(a1, i)]) k1);
+
+let buildNFA rules = buildAllFrom rules 0 0 [] [] 1;
+
+(* ================================================================
+   4. 部分集合構成で DFA を作る
+   ================================================================ *)
+
+let rec epsTargets trans s acc =
+  match trans with
+    [] -> acc
+  | (f, l, t) :: r -> epsTargets r s (if f = s && l = "" then insSorted t acc else acc);
+
+let rec eclosLoop trans work acc =
+  match work with
+    [] -> acc
+  | s :: rest ->
+      let ts = epsTargets trans s [] in
+      let fresh = filter (fun t -> not (memL t acc)) ts in
+      eclosLoop trans (app fresh rest) (unionSorted fresh acc);
+
+let eclosure trans ss = eclosLoop trans ss ss;
+
+let rec moveOn trans ss c acc =
+  match trans with
+    [] -> acc
+  | (f, l, t) :: r ->
+      moveOn r ss c (if memL f ss && not (l = "") && inSet l c then insSorted t acc else acc);
+
+(* この状態集合から出ている文字をすべて集める *)
+let rec charsOut trans ss acc =
+  match trans with
+    [] -> acc
+  | (f, l, t) :: r -> charsOut r ss (if memL f ss && not (l = "") then unionChars acc l else acc);
+
+(* 1 つの DFA 状態について、各文字の行き先を決める。
+   states と work と遷移表を育てて返す *)
+let rec scanChars trans ss i n chars states work tout src =
+  if i >= n then (states, work, tout)
+  else
+    (let c = sub chars i in
+     let tgt = eclosure trans (moveOn trans ss c []) in
+     if tgt = [] then scanChars trans ss (i+1) n chars states work tout src
+     else
+       (let j = indexOf tgt states in
+        if j >= 0 then
+          scanChars trans ss (i+1) n chars states work (app tout [(src, c, j)]) src
+        else
+          (let nj = length states in
+           scanChars trans ss (i+1) n chars (app states [tgt])
+             (app work [(nj, tgt)]) (app tout [(src, c, nj)]) src)));
+
+let rec subsetLoop trans states work tout =
+  match work with
+    [] -> (states, tout)
+  | (idx, ss) :: rest ->
+      (match scanChars trans ss 0 (size (charsOut trans ss "")) (charsOut trans ss "")
+               states rest tout idx with
+         (st2, wk2, to2) -> subsetLoop trans st2 wk2 to2);
+
+(* DFA 状態が受理する規則番号。無ければ -1 *)
+let rec minRule accs ss best =
+  match ss with
+    [] -> best
+  | s :: r ->
+      (let v = lookupS s (0 - 1) accs in
+       minRule accs r (if v < 0 then best else if best < 0 then v else if v < best then v else best));
+
+(* 遷移表を状態ごとにまとめる。駆動が速くなる *)
+let rec groupFrom tout i n acc =
+  if i >= n then acc
+  else
+    (let row = map (fun e -> (fst (snd e), snd (snd e)))
+                 (filter (fun e -> fst e = i) tout) in
+     groupFrom tout (i+1) n (app acc [(i, row)]));
+
+(* 1 つの開始状態について DFA を作る。
+   戻り値は (遷移表, 受理表, 状態数) *)
+let makeDFA rules =
+  match buildNFA rules with
+    (start, trans, accs, k) ->
+      (let s0 = eclosure trans [start] in
+       match subsetLoop trans [s0] [(0, s0)] [] with
+         (states, tout) ->
+           (let n = length states in
+            let tbl = groupFrom tout 0 n [] in
+            let acc = map (fun ss -> minRule accs ss (0 - 1)) states in
+            (tbl, acc, n)));
+
+(* すべての開始状態について作る。(開始状態名, 表, 受理, 状態数, 動作名) *)
+let rec makeAll allRules sts acc =
+  match sts with
+    [] -> acc
+  | st :: r ->
+      (let mine = filter (fun x -> fst x = st) allRules in
+       let pairs = map (fun x -> (fst (snd x), snd (snd x))) mine in
+       match makeDFA pairs with
+         (tbl, ac, n) ->
+           makeAll allRules r (app acc [(st, tbl, ac, n, map snd pairs)]));
+
+(* ================================================================
+   5. 駆動部
+
+   最長一致。受理した位置を覚えながら進み、行き止まりで戻る。
+   ================================================================ *)
+
+let rec rowLookup row c = match row with
+    [] -> 0 - 1
+  | (ch, d) :: r -> (if ch = c then d else rowLookup r c);
+
+let dtrans tbl st c = rowLookup (lookupS st [] tbl) c;
+
+let rec runFrom tbl acc st i n src bR bP =
+  let a = nthD (0 - 1) st acc in
+  let bR2 = (if a >= 0 then a else bR) in
+  let bP2 = (if a >= 0 then i else bP) in
+  if i >= n then (bR2, bP2)
+  else
+    (let nx = dtrans tbl st (sub src i) in
+     if nx < 0 then (bR2, bP2) else runFrom tbl acc nx (i+1) n src bR2 bP2);
+
+(* src の pos から 1 つ切り出す。(規則番号, 次の位置) を返す。
+   受理できなければ規則番号 -1 *)
+let scanOne tbl acc src pos n = runFrom tbl acc 0 pos n src (0 - 1) pos;
+
+let rec substrFrom s i j acc = if i >= j then acc else substrFrom s (i+1) j (acc ^ sub s i);
+let substr s i j = substrFrom s i j "";
+
+(* ================================================================
+   6. 表を MiniML の原文として書き出す
+   ================================================================ *)
+
+let escC c =
+  if c = "\n" then "\\n" else if c = "\t" then "\\t"
+  else if c = "\"" then "\\\"" else if c = "\\" then "\\\\" else c;
+
+let showRow r =
+  "[" ^ joins ";" (map (fun p -> "(\"" ^ escC (fst p) ^ "\"," ^ string_of_int (snd p) ^ ")") r) ^ "]";
+
+let showTbl tbl =
+  "[" ^ joins ";\n   " (map (fun e -> "(" ^ string_of_int (fst e) ^ "," ^ showRow (snd e) ^ ")") tbl) ^ "]";
+
+let showAcc a = "[" ^ joins ";" (map string_of_int a) ^ "]";
+
+(* ================================================================
+   7. 動かす
+   ================================================================ *)
+
+let check s b = print_string ("  " ^ (if b then "OK  " else "NG  ") ^ s ^ "\n");
+let say s = print_string (s ^ "\n");
+
+(* ---- 例1: 小さな電卓の字句 ---- *)
+let spec1 =
+  "digit = [0-9];\n" ^
+  "alpha = [A-Za-z];\n" ^
+  "%%\n" ^
+  "{digit}+          => (NUM);\n" ^
+  "{alpha}({alpha}|{digit})*  => (ID);\n" ^
+  "\"+\"               => (PLUS);\n" ^
+  "\"*\"               => (TIMES);\n" ^
+  "\"(\"               => (LP);\n" ^
+  "\")\"               => (RP);\n" ^
+  "[ \\t\\n]+          => (SKIP);\n";
+
+(* 記号列にする。SKIP は落とす *)
+let rec lexLoop tbl acc acts src pos n out =
+  if pos >= n then rev out
+  else
+    (match scanOne tbl acc src pos n with
+       (r, np) ->
+         if r < 0 then rev (("ERROR", substr src pos (pos+1)) :: out)
+         else
+           (let name = nthD "" r acts in
+            let text = substr src pos np in
+            let np2 = (if np <= pos then pos + 1 else np) in
+            lexLoop tbl acc acts src np2 n
+              (if name = "SKIP" then out else (name, text) :: out)));
+
+let showTok t = fst t ^ "(" ^ snd t ^ ")";
+
+let demo1 u =
+  let hd = readHead [] [] (explode spec1) in
+  let rules = readRules (fst (snd hd)) [] (snd (snd hd)) in
+  let sts = app ["INITIAL"] (fst hd) in
+  match makeAll rules sts [] with
+    [] -> say "  規則がありません"
+  | (nm, tbl, ac, n, acts) :: _ ->
+      let u1 = say ("  開始状態 " ^ nm ^ " : DFA の状態数 = " ^ string_of_int n) in
+      let u2 = say ("  規則 = " ^ joins ", " acts) in
+      let run s = say ("  " ^ s ^ "\n    -> " ^
+                       joins " " (map showTok (lexLoop tbl ac acts s 0 (size s) []))) in
+      let u3 = iter run ["12+34"; "x1 * (y + 7)"; "abc 42"] in
+      say ("  表の一部 : 状態0 = " ^ showRow (lookupS 0 [] tbl));
+
+say "-- 例1: 小さな電卓の字句解析器を生成して動かす --";
+demo1 ();
+
+(* ---- 例2: MiniML の字句。開始状態を使う ---- *)
+let specML =
+  "%s COMMENT STR;\n" ^
+  "digit  = [0-9];\n" ^
+  "idfst  = [A-Za-z_];\n" ^
+  "idchar = [A-Za-z0-9_'];\n" ^
+  "%%\n" ^
+  "<INITIAL>[ \\t\\r\\n]+   => (SKIP);\n" ^
+  "<INITIAL>\"(*\"          => (CSTART);\n" ^
+  "<INITIAL>\"\\\"\"          => (SSTART);\n" ^
+  "<INITIAL>{digit}+      => (NUM);\n" ^
+  "<INITIAL>{idfst}{idchar}* => (WORD);\n" ^
+  "<INITIAL>\"->\"          => (ARROW);\n" ^
+  "<INITIAL>\"::\"          => (CONS);\n" ^
+  "<INITIAL>\"<=\"          => (LE);\n" ^
+  "<INITIAL>\">=\"          => (GE);\n" ^
+  "<INITIAL>\"<>\"          => (NE);\n" ^
+  "<INITIAL>\"&&\"          => (ANDALSO);\n" ^
+  "<INITIAL>\"||\"          => (ORELSE);\n" ^
+  "<INITIAL>[-+*/^=<>,|()\\[\\];:_.!?~@#$%&{}\\\\']  => (SYM);\n" ^
+  "<COMMENT>\"(*\"          => (CIN);\n" ^
+  "<COMMENT>\"*)\"          => (COUT);\n" ^
+  "<COMMENT>.             => (CANY);\n" ^
+  "<COMMENT>\\n            => (CANY);\n" ^
+  "<STR>\"\\\"\"              => (SEND);\n" ^
+  "<STR>\"\\\\\"n            => (SESCN);\n" ^
+  "<STR>\"\\\\\"t            => (SESCT);\n" ^
+  "<STR>\"\\\\\".            => (SESC);\n" ^
+  "<STR>.                 => (SANY);\n" ^
+  "<STR>\\n                => (SANY);\n";
+
+(* ================================================================
+   8. 生成した表で MiniML を字句解析する
+
+   動作の名前に応じて開始状態を切り替える。ML-Lex の action に
+   あたる部分で、利用者が書く。参照が無いので、開始状態・コメントの
+   深さ・文字列の途中経過を引数で持ち回る。
+   ================================================================ *)
+
+let rec getTab tabs nm =
+  match tabs with
+    [] -> ([], [], [])
+  | (n, tbl, ac, k, acts) :: r -> (if n = nm then (tbl, ac, acts) else getTab r nm);
+
+let isKw s =
+  s = "let" || s = "rec" || s = "in" || s = "if" || s = "then" || s = "else" ||
+  s = "fun" || s = "function" || s = "match" || s = "with" ||
+  s = "true" || s = "false" || s = "mod";
+
+(* 数字の列を整数へ。int_of_string は組み込みに無いので自分で作る *)
+let rec toIntFrom s i n acc =
+  if i >= n then acc else toIntFrom s (i+1) n (acc * 10 + (ord (sub s i) - 48));
+let toInt s = toIntFrom s 0 (size s) 0;
+
+let rec genLex tabs st depth sacc src pos n out =
+  if pos >= n then
+    (if st = "INITIAL" then rev out else rev (("err", "unterminated", 0) :: out))
+  else
+    (match getTab tabs st with
+       (tbl, ac, acts) ->
+         (match scanOne tbl ac src pos n with
+            (r, np) ->
+              if r < 0 then rev (("err", substr src pos (pos+1), 0) :: out)
+              else
+                (let name = nthD "" r acts in
+                 let text = substr src pos np in
+                 let np2 = (if np <= pos then pos + 1 else np) in
+                 if name = "SKIP" then genLex tabs st depth sacc src np2 n out
+                 else if name = "CSTART" then genLex tabs "COMMENT" 1 sacc src np2 n out
+                 else if name = "CIN" then genLex tabs "COMMENT" (depth+1) sacc src np2 n out
+                 else if name = "COUT" then
+                   (if depth <= 1 then genLex tabs "INITIAL" 0 sacc src np2 n out
+                    else genLex tabs "COMMENT" (depth-1) sacc src np2 n out)
+                 else if name = "CANY" then genLex tabs "COMMENT" depth sacc src np2 n out
+                 else if name = "SSTART" then genLex tabs "STR" depth "" src np2 n out
+                 else if name = "SEND" then
+                   genLex tabs "INITIAL" depth "" src np2 n (("str", sacc, 0) :: out)
+                 else if name = "SESCN" then genLex tabs "STR" depth (sacc ^ "\n") src np2 n out
+                 else if name = "SESCT" then genLex tabs "STR" depth (sacc ^ "\t") src np2 n out
+                 else if name = "SESC" then
+                   genLex tabs "STR" depth (sacc ^ substr text 1 (size text)) src np2 n out
+                 else if name = "SANY" then genLex tabs "STR" depth (sacc ^ text) src np2 n out
+                 else if name = "NUM" then
+                   genLex tabs st depth sacc src np2 n (("num", "", toInt text) :: out)
+                 else if name = "WORD" then
+                   genLex tabs st depth sacc src np2 n
+                     ((if text = "_" then ("op", "_", 0)
+                       else if isKw text then ("kw", text, 0)
+                       else ("id", text, 0)) :: out)
+                 else genLex tabs st depth sacc src np2 n (("op", text, 0) :: out))));
+
+(* ================================================================
+   9. 突き合わせの相手 -- 手書きの字句解析器（lexer.mml と同じもの）
+   ================================================================ *)
+
+let isIdChar c = isAlpha c || isDigit c || c = "_" || c = "'";
+let isIdStart c = isAlpha c || c = "_";
+let isTwo s =
+  s = "->" || s = "::" || s = "<=" || s = ">=" || s = "<>" || s = "&&" || s = "||";
+
+let rec hScanNum acc cs =
+  match cs with
+    [] -> (acc, [])
+  | c :: r -> (if isDigit c then hScanNum (acc * 10 + (ord c - 48)) r else (acc, cs));
+let rec hScanId acc cs =
+  match cs with
+    [] -> (acc, [])
+  | c :: r -> (if isIdChar c then hScanId (acc ^ c) r else (acc, cs));
+let rec hSkipC d cs =
+  if d = 0 then cs
+  else
+    (match cs with
+       [] -> []
+     | a :: r ->
+         (match r with
+            [] -> []
+          | b :: r2 ->
+              if a = "(" && b = "*" then hSkipC (d+1) r2
+              else if a = "*" && b = ")" then hSkipC (d-1) r2
+              else hSkipC d r));
+let rec hScanStr acc cs =
+  match cs with
+    [] -> (acc, [])
+  | c :: r ->
+      if c = "\"" then (acc, r)
+      else if c = "\\" then
+        (match r with
+           [] -> (acc, [])
+         | e :: r2 ->
+             (if e = "n" then hScanStr (acc ^ "\n") r2
+              else if e = "t" then hScanStr (acc ^ "\t") r2
+              else hScanStr (acc ^ e) r2))
+      else hScanStr (acc ^ c) r;
+
+let rec handLex cs =
+  match cs with
+    [] -> []
+  | c :: r ->
+      if isSpace c then handLex r
+      else if isDigit c then (let p = hScanNum 0 cs in ("num", "", fst p) :: handLex (snd p))
+      else if isIdStart c then
+        (let p = hScanId "" cs in
+         let s = fst p in
+         (if s = "_" then ("op", "_", 0)
+          else if isKw s then ("kw", s, 0)
+          else ("id", s, 0)) :: handLex (snd p))
+      else if c = "\"" then (let p = hScanStr "" r in ("str", fst p, 0) :: handLex (snd p))
+      else
+        (match r with
+           [] -> [("op", c, 0)]
+         | d :: r2 ->
+             (if c = "(" && d = "*" then handLex (hSkipC 1 r2)
+              else if isTwo (c ^ d) then ("op", c ^ d, 0) :: handLex r2
+              else ("op", c, 0) :: handLex r));
+
+let showTok3 t =
+  let k = fst t in
+  let s = fst (snd t) in
+  (if k = "num" then "num " ^ string_of_int (snd (snd t))
+   else if k = "str" then "str \"" ^ s ^ "\""
+   else k ^ " " ^ s);
+let showToks ts = joins " | " (map showTok3 ts);
+
+let demo2 u =
+  let hd = readHead [] [] (explode specML) in
+  let rules = readRules (fst (snd hd)) [] (snd (snd hd)) in
+  let sts = app ["INITIAL"] (fst hd) in
+  let u0 = say ("  宣言された開始状態 : " ^ joins " " sts) in
+  let u1 = say ("  規則の総数 : " ^ string_of_int (length rules)) in
+  let tabs = makeAll rules sts [] in
+  let u2 = iter (fun e ->
+          match e with
+            (nm, tbl, ac, n, acts) ->
+              say ("  " ^ nm ^ " : 規則 " ^ string_of_int (length acts) ^ " 本、DFA 状態 "
+                   ^ string_of_int n))
+       tabs in
+  let gen s = genLex tabs "INITIAL" 0 "" s 0 (size s) [] in
+  let cmp s = say ("  " ^ (if gen s = handLex (explode s) then "OK  " else "NG  ") ^ s) in
+  let u3 = say "  -- 生成した字句解析器と手書きの字句解析器の出力を突き合わせる --" in
+  let u4 = iter cmp
+    [ "let rec fac n = if n = 0 then 1 else n * fac (n-1);";
+      "match l with [] -> 0 | x :: r -> 1 + f r;";
+      "a <= b && c <> d || e >= f;";
+      "fun x y -> [x; y; 1000000000000000000000];";
+      "let s = \"hi\\nthere\" ^ \"!\" in size s;";
+      "(* a (* b *) c *) 1 + 2";
+      "_ _x x_ x'";
+      "-> :: <= >= <> && || - : < > & |";
+      "let  f x=x+1;";
+      "123456789012345678901234567890";
+      "\"a\\nb\\tc\\\"d\"";
+      "42 mod 5" ] in
+  let u5 = say "  -- 切り出した記号列の例 --" in
+  let one s = say ("  " ^ s ^ "\n    -> " ^ showToks (gen s)) in
+  iter one
+    [ "let rec fac n = if n = 0 then 1 else n * fac (n-1);";
+      "(* 入れ子の (* コメント *) は飛ばす *) 42 mod 5;" ];
+
+say "-- 例2: MiniML の字句仕様から DFA を作り、手書き版と突き合わせる --";
+demo2 ();

@@ -197,3 +197,44 @@ $ ./minicaml2 F > a; ./miniml3 F > b; diff a b
 手書き版は「何を期待して何が来たか」を持っていますが、ML-Yacc の
 誤り処理は表に基づく修復案を作るしくみで、こちらは修復せず位置だけを
 報告しているためです。受理する言語そのものは変わりません。
+
+## 自作の生成器と、その応用（教科書 第15章〜第17章）
+
+`~/yas/seminar/smlbook` の『ML 演習 --- The Meta Language』第2増補版のために
+書いたもの。**MiniML だけで** ML-Lex と ML-Yacc に相当する生成器を作り、
+それで MiniML 自身と、Prolog と C コンパイラを作る。
+
+| ファイル | 内容 | 走らせ方 |
+|---|---|---|
+| `mlex.mml` | ML-Lex 相当の字句解析器生成器。正規表現→Thompson 構成の NFA→部分集合構成の DFA→遷移表。開始状態あり | `./miniml3 mlex.mml` |
+| `myacc.mml` | ML-Yacc 相当の構文解析器生成器。LR(0) 項集合→先読みの自発的生成と伝播→LALR(1) 表。比較用に SLR(1) 表構成も持つ | `./miniml3 myacc.mml` |
+| `selfhost_tail.mml` | 自作生成器 2 つで MiniML を作る本体 | `make gen && ./miniml3 selfhost.mml` |
+| `ccomp_tail.mml` | C のサブセットをスタック仮想機械へコンパイルする本体。VM 込み | `make gen && ./miniml3 ccomp.mml` |
+| `prolog.mml` | Prolog。複合項・リスト・**全解列挙** | `./miniml3 prolog.mml` |
+| `build_gen.py` / `build_all.py` | この処理系にはモジュールが無いので、生成器の本体と各章の本体を連結して `selfhost.mml` / `ccomp.mml` を作る | `make gen` |
+
+`make tools` で 5 本まとめて走る。`selfhost.mml` と `ccomp.mml` は生成物なので
+リポジトリには入れない（`make gen` で作る）。
+
+### 検証できていること
+
+- **mlex**: 生成した字句解析器と手書きの字句解析器の出力が **12 項目すべて一致**
+  （入れ子コメント、文字列のエスケープ、多倍長整数、2 文字演算子を含む）
+- **myacc**: `miniml.grm` と同じ文法に対し、本物の `mlyacc` と
+  **LR(0) 状態数 133 が一致**、shift/reduce 衝突 2 件・記号 `BAR`・
+  還元される規則（`cases -> caselist` と `cases -> BAR caselist`）も一致
+- **LALR(1) vs SLR(1)**: 関数適用の文法（`appseq : ID args | atexp`）で
+  LALR **0 件** / SLR **3 件**（`ID`/`LPAREN`/`NUM`＝FIRST(atexp)）
+- **selfhost**: 生成した 2 表だけで `fac 10 = 3628800`、`fib 20 = 6765`、
+  `gcd 1071 462 = 21`、優先順位・結合・単項マイナスすべて正しい
+- **ccomp**: `fact(10)=3628800`、`fib(15)=610`、`gcd=21`、`sumto(100)=5050`、
+  100 以下の素数 25 個。ぶら下がり else の衝突を検出し shift で解決
+- **prolog**: `append(X,Y,[1,2,3])` の 4 分割をすべて列挙
+
+### この処理系で書くときの落とし穴（実際に踏んだもの）
+
+**文字列リテラルが解釈するエスケープは `\n` `\t` `\\` `\"` の 4 つだけ**で、
+それ以外の `\c` は `c` になる。つまり `"\r"` は復帰文字ではなく**文字 `r`**。
+これに気づかず `isSpace` に `c = "\r"` と書いたため、`r` が空白と判定され、
+定義名 `idchar` が `idcha` に化けて名前解決が静かに失敗した。
+復帰文字は `chr 13` と書く。

@@ -1,0 +1,755 @@
+(* ================================================================
+   myacc.mml -- MiniML で書いた ML-Yacc 相当の構文解析器生成器
+   実行:  ./miniml3 myacc.mml
+
+   文法を読んで LALR(1) の ACTION / GOTO 表を作り、その表で駆動する
+   LR 構文解析器を動かす。
+
+   作り方は次のとおり。
+     (1) LR(0) 項集合の標準集成を作る
+     (2) 各状態の核項について、先読みの「自発的生成」と「伝播」を求める
+         （ダミーの先読み # を使う）
+     (3) 伝播を不動点まで繰り返す
+     (4) 核の先読みから LR(1) 閉包を取り、還元を読み出して表を作る
+
+   標準 LR(1) 集成を作ってから同じ核どうしを併合する方法より、
+   状態数がずっと少なくて済む。
+
+   ML-Yacc と同じく衝突を検出して報告する。shift/reduce は shift を、
+   reduce/reduce は番号の小さい規則を選ぶ。
+
+   仕様の書き方
+
+     %term NUM | PLUS | TIMES | LP | RP
+     %nonterm exp | term | factor
+     %start exp
+     %%
+     exp    : exp PLUS term | term ;
+     term   : term TIMES factor | factor ;
+     factor : NUM | LP exp RP ;
+
+   意味値は代数的データ型が無いので前置記法の平坦なリストで表す。
+   節点は (種別, 名前, 数) の三つ組で、meta.mml が解釈できる形と同じ。
+   ================================================================ *)
+
+(* ---------------- リストの基本 ---------------- *)
+let rec map f l = match l with [] -> [] | x :: r -> f x :: map f r;
+let rec iter f l = match l with [] -> () | x :: r -> let u = f x in iter f r;
+let rec app a b = match a with [] -> b | x :: r -> x :: app r b;
+let rec length l = match l with [] -> 0 | _ :: r -> 1 + length r;
+let rec rev1 acc l = match l with [] -> acc | x :: r -> rev1 (x :: acc) r;
+let rev l = rev1 [] l;
+let rec filter p l =
+  match l with [] -> [] | x :: r -> (if p x then x :: filter p r else filter p r);
+let rec joins sep l =
+  match l with [] -> "" | [x] -> x | x :: r -> x ^ sep ^ joins sep r;
+let rec memL x l = match l with [] -> false | y :: r -> x = y || memL x r;
+let rec lookupS k d l =
+  match l with [] -> d | (a, b) :: r -> (if a = k then b else lookupS k d r);
+let rec setA k v l =
+  match l with
+    [] -> [(k, v)]
+  | (a, b) :: r -> (if a = k then (k, v) :: r else (a, b) :: setA k v r);
+let rec nthD d i l = match l with [] -> d | x :: r -> (if i <= 0 then x else nthD d (i-1) r);
+let rec idxFrom x l i =
+  match l with [] -> 0 - 1 | y :: r -> (if x = y then i else idxFrom x r (i+1));
+let indexOf x l = idxFrom x l 0;
+let rec dropN i l = if i <= 0 then l else (match l with [] -> [] | _ :: r -> dropN (i-1) r);
+let rec takeN i l = if i <= 0 then [] else (match l with [] -> [] | x :: r -> x :: takeN (i-1) r);
+let rec concatL l = match l with [] -> [] | x :: r -> app x (concatL r);
+let rec upto i n = if i > n then [] else i :: upto (i+1) n;
+
+(* 整列した挿入。重複は入れない。= がそのまま集合の同値判定になる *)
+let rec insS x l =
+  match l with
+    [] -> [x]
+  | y :: r -> (if x = y then l else if x < y then x :: l else y :: insS x r);
+let rec unionS a b = match a with [] -> b | x :: r -> unionS r (insS x b);
+
+let ltP a b = fst a < fst b || (fst a = fst b && snd a < snd b);
+let rec insP x l =
+  match l with
+    [] -> [x]
+  | y :: r -> (if x = y then l else if ltP x y then x :: l else y :: insP x r);
+let rec unionP a b = match a with [] -> b | x :: r -> unionP r (insP x b);
+
+let lt3 a b =
+  fst a < fst b ||
+  (fst a = fst b &&
+   (fst (snd a) < fst (snd b) ||
+    (fst (snd a) = fst (snd b) && snd (snd a) < snd (snd b))));
+let rec ins3 x l =
+  match l with
+    [] -> [x]
+  | y :: r -> (if x = y then l else if lt3 x y then x :: l else y :: ins3 x r);
+let rec insAll3 xs acc = match xs with [] -> acc | x :: r -> insAll3 r (ins3 x acc);
+
+let isSpace c = c = " " || c = "\t" || c = "\n" || c = chr 13;
+
+(* ================================================================
+   1. 文法仕様の読み取り
+   ================================================================ *)
+
+let rec splitWords acc cur cs =
+  match cs with
+    [] -> (if cur = "" then rev acc else rev (cur :: acc))
+  | c :: r ->
+      (if isSpace c then splitWords (if cur = "" then acc else cur :: acc) "" r
+       else splitWords acc (cur ^ c) r);
+let words s = splitWords [] "" (explode s);
+
+let rec dropSpace cs =
+  match cs with [] -> [] | c :: r -> (if isSpace c then dropSpace r else cs);
+
+let rec scanTo stop acc cs =
+  match cs with
+    [] -> (rev acc, [])
+  | c :: r -> (if c = stop then (rev acc, r) else scanTo stop (c :: acc) r);
+
+let isSep cs =
+  match cs with
+    [] -> false
+  | a :: r -> (match r with [] -> false | b :: _ -> a = "%" && b = "%");
+let dropSep cs =
+  match cs with [] -> [] | _ :: r -> (match r with [] -> [] | _ :: r2 -> r2);
+
+let noBar l = filter (fun w -> not (w = "|")) l;
+
+let rec readHead ts ns st cs =
+  let cs2 = dropSpace cs in
+  if cs2 = [] then (ts, ns, st, [])
+  else if isSep cs2 then (ts, ns, st, dropSep cs2)
+  else
+    (let p = scanTo "\n" [] cs2 in
+     let ws = words (implode (fst p)) in
+     match ws with
+       [] -> readHead ts ns st (snd p)
+     | k :: rest ->
+         (if k = "%term" then readHead (app ts (noBar rest)) ns st (snd p)
+          else if k = "%nonterm" then readHead ts (app ns (noBar rest)) st (snd p)
+          else if k = "%start" then
+            readHead ts ns (match rest with [] -> st | x :: _ -> x) (snd p)
+          else readHead ts ns st (snd p)));
+
+let rec expandAlts lhs acc cur ws =
+  match ws with
+    [] -> rev ((lhs, rev cur) :: acc)
+  | w :: r ->
+      (if w = "|" then expandAlts lhs ((lhs, rev cur) :: acc) [] r
+       else expandAlts lhs acc (w :: cur) r);
+
+let rec readProds acc cs =
+  let cs2 = dropSpace cs in
+  if cs2 = [] then acc
+  else
+    (let p = scanTo ";" [] cs2 in
+     let ws = words (implode (fst p)) in
+     match ws with
+       [] -> acc
+     | lhs :: rest ->
+         (match rest with
+            [] -> acc
+          | colon :: body -> readProds (app acc (expandAlts lhs [] [] body)) (snd p)));
+
+(* ================================================================
+   2. 文法の下ごしらえ
+   ================================================================ *)
+
+let lhsOf prods p = fst (nthD ("", []) p prods);
+let rhsOf prods p = snd (nthD ("", []) p prods);
+let symAt prods p d = nthD "" d (rhsOf prods p);
+let atEnd prods p d = d >= length (rhsOf prods p);
+
+let rec prodsForFrom prods nt i acc =
+  match prods with
+    [] -> rev acc
+  | (l, r) :: rest -> prodsForFrom rest nt (i+1) (if l = nt then i :: acc else acc);
+let prodsFor prods nt = prodsForFrom prods nt 0 [];
+
+(* nullable の不動点 *)
+let rec allNullable nul syms =
+  match syms with
+    [] -> true
+  | s :: r -> (if lookupS s false nul then allNullable nul r else false);
+
+let rec nulPass nul changed ps =
+  match ps with
+    [] -> (nul, changed)
+  | (l, r) :: rest ->
+      (if (not (lookupS l false nul)) && allNullable nul r then
+         nulPass (setA l true nul) true rest
+       else nulPass nul changed rest);
+
+let rec nulFix prods nul =
+  match nulPass nul false prods with (n2, ch) -> (if ch then nulFix prods n2 else n2);
+
+(* FIRST の不動点 *)
+let rec firstSeq nts nul fst1 syms =
+  match syms with
+    [] -> []
+  | s :: r ->
+      (if memL s nts then
+         (if lookupS s false nul then unionS (lookupS s [] fst1) (firstSeq nts nul fst1 r)
+          else lookupS s [] fst1)
+       else [s]);
+
+let rec fstPass nts nul fst1 changed ps =
+  match ps with
+    [] -> (fst1, changed)
+  | (l, r) :: rest ->
+      (let old = lookupS l [] fst1 in
+       let nw = unionS (firstSeq nts nul fst1 r) old in
+       if nw = old then fstPass nts nul fst1 changed rest
+       else fstPass nts nul (setA l nw fst1) true rest);
+
+let rec fstFix nts nul fst1 prods =
+  match fstPass nts nul fst1 false prods with
+    (f2, ch) -> (if ch then fstFix nts nul f2 prods else f2);
+
+(* ================================================================
+   3. LR(0) 項集合の標準集成
+   ================================================================ *)
+
+let rec clos0Loop prods nts work acc =
+  match work with
+    [] -> acc
+  | (p, d) :: rest ->
+      (let s = symAt prods p d in
+       if memL s nts then
+         (let cand = map (fun q -> (q, 0)) (prodsFor prods s) in
+          let fresh = filter (fun it -> not (memL it acc)) cand in
+          clos0Loop prods nts (app fresh rest) (unionP fresh acc))
+       else clos0Loop prods nts rest acc);
+
+let clos0 prods nts items = clos0Loop prods nts items items;
+
+let rec symsAfter prods items acc =
+  match items with
+    [] -> acc
+  | (p, d) :: r ->
+      (let s = symAt prods p d in symsAfter prods r (if s = "" then acc else insS s acc));
+
+let goto0 prods nts items x =
+  clos0 prods nts
+    (map (fun it -> (fst it, snd it + 1))
+         (filter (fun it -> symAt prods (fst it) (snd it) = x) items));
+
+let rec gotoAll prods nts items syms i states work gt =
+  match syms with
+    [] -> (states, work, gt)
+  | x :: r ->
+      (let j = goto0 prods nts items x in
+       if j = [] then gotoAll prods nts items r i states work gt
+       else
+         (let k = indexOf j states in
+          if k >= 0 then gotoAll prods nts items r i states work (app gt [((i, x), k)])
+          else
+            (let nk = length states in
+             gotoAll prods nts items r i (app states [j]) (app work [(nk, j)])
+               (app gt [((i, x), nk)]))));
+
+let rec collLoop prods nts states work gt =
+  match work with
+    [] -> (states, gt)
+  | (i, items) :: rest ->
+      (match gotoAll prods nts items (symsAfter prods items []) i states rest gt with
+         (st2, wk2, gt2) -> collLoop prods nts st2 wk2 gt2);
+
+let collection prods nts =
+  let i0 = clos0 prods nts [(0, 0)] in
+  collLoop prods nts [i0] [(0, i0)] [];
+
+(* ================================================================
+   4. LR(1) 閉包
+   ================================================================ *)
+
+let rec clos1Loop prods nts nul fst1 work acc =
+  match work with
+    [] -> acc
+  | (p, d, a) :: rest ->
+      (let b = symAt prods p d in
+       if memL b nts then
+         (let las = firstSeq nts nul fst1 (app (dropN (d+1) (rhsOf prods p)) [a]) in
+          let cand = concatL (map (fun q -> map (fun x -> (q, 0, x)) las) (prodsFor prods b)) in
+          let fresh = filter (fun it -> not (memL it acc)) cand in
+          clos1Loop prods nts nul fst1 (app fresh rest) (insAll3 fresh acc))
+       else clos1Loop prods nts nul fst1 rest acc);
+
+let clos1 prods nts nul fst1 items = clos1Loop prods nts nul fst1 items items;
+
+(* ================================================================
+   5. LALR(1) の先読み -- 自発的生成と伝播
+   ================================================================ *)
+
+let kernelOf items = filter (fun it -> snd it > 0 || fst it = 0) items;
+
+(* 1 つの核項について J = clos1({(p,d,#)}) を作り、
+   自発的に生まれる先読みと、伝播の辺を集める *)
+let rec spreadLoop prods nts gt i k js la prop =
+  match js with
+    [] -> (la, prop)
+  | (q, e, a) :: r ->
+      (let x = symAt prods q e in
+       if x = "" then spreadLoop prods nts gt i k r la prop
+       else
+         (let j = lookupS (i, x) (0 - 1) gt in
+          if j < 0 then spreadLoop prods nts gt i k r la prop
+          else
+            (let k2 = (q, e + 1) in
+             if a = "#" then
+               spreadLoop prods nts gt i k r la (app prop [((i, k), (j, k2))])
+             else
+               spreadLoop prods nts gt i k r
+                 (setA (j, k2) (insS a (lookupS (j, k2) [] la)) la) prop)));
+
+let rec spreadKernels prods nts nul fst1 gt i ks la prop =
+  match ks with
+    [] -> (la, prop)
+  | k :: r ->
+      (let js = clos1 prods nts nul fst1 [(fst k, snd k, "#")] in
+       match spreadLoop prods nts gt i k js la prop with
+         (la2, pr2) -> spreadKernels prods nts nul fst1 gt i r la2 pr2);
+
+let rec spreadStates prods nts nul fst1 gt states i la prop =
+  match states with
+    [] -> (la, prop)
+  | items :: r ->
+      (match spreadKernels prods nts nul fst1 gt i (kernelOf items) la prop with
+         (la2, pr2) -> spreadStates prods nts nul fst1 gt r (i+1) la2 pr2);
+
+let rec propPass prop la changed =
+  match prop with
+    [] -> (la, changed)
+  | (src, dst) :: r ->
+      (let s = lookupS src [] la in
+       let old = lookupS dst [] la in
+       let nw = unionS s old in
+       if nw = old then propPass r la changed
+       else propPass r (setA dst nw la) true);
+
+let rec propFix prop la =
+  match propPass prop la false with (la2, ch) -> (if ch then propFix prop la2 else la2);
+
+(* ================================================================
+   6. ACTION / GOTO 表を組み立てる
+   ================================================================ *)
+
+(* 衝突を検出しながら 1 つの動作を入れる。
+   shift/reduce は shift、reduce/reduce は番号の小さい規則を採る *)
+let addAct i t a acts msgs =
+  let old = lookupS t ("", 0) (lookupS i [] acts) in
+  if fst old = "" then (setA i (setA t a (lookupS i [] acts)) acts, msgs)
+  else if old = a then (acts, msgs)
+  else
+    (let keep =
+       (if fst old = "s" && fst a = "r" then old
+        else if fst old = "r" && fst a = "s" then a
+        else if fst old = "r" && fst a = "r" then
+          (if snd old <= snd a then old else a)
+        else old) in
+     let kind = (if fst old = "r" && fst a = "r" then "reduce/reduce" else "shift/reduce") in
+     let sh = (if fst old = "s" then snd old else snd a) in
+     let rd = (if fst old = "r" then snd old else snd a) in
+     let detail =
+       (if kind = "shift/reduce" then
+          "（shift " ^ t ^ " -> 状態 " ^ string_of_int sh
+          ^ " / 規則 " ^ string_of_int rd ^ " で還元。shift を採る）"
+        else "（規則 " ^ string_of_int (snd old) ^ " と " ^ string_of_int (snd a)
+             ^ "。番号の小さい方を採る）") in
+     (setA i (setA t keep (lookupS i [] acts)) acts,
+      app msgs [("状態 " ^ string_of_int i ^ " 記号 " ^ t ^ " で " ^ kind ^ " 衝突 " ^ detail)]));
+
+(* 還元を入れる *)
+let rec addReds prods i js acts msgs =
+  match js with
+    [] -> (acts, msgs)
+  | (q, e, a) :: r ->
+      (if atEnd prods q e then
+         (if q = 0 then
+            (match addAct i a ("a", 0) acts msgs with (ac, ms) -> addReds prods i r ac ms)
+          else
+            (match addAct i a ("r", q) acts msgs with (ac, ms) -> addReds prods i r ac ms))
+       else addReds prods i r acts msgs);
+
+(* 移動を入れる *)
+let rec addShifts ts i gt acts msgs =
+  match ts with
+    [] -> (acts, msgs)
+  | t :: r ->
+      (let j = lookupS (i, t) (0 - 1) gt in
+       if j < 0 then addShifts r i gt acts msgs
+       else (match addAct i t ("s", j) acts msgs with (ac, ms) -> addShifts r i gt ac ms));
+
+let rec buildStates prods nts nul fst1 ts gt la states i acts msgs =
+  match states with
+    [] -> (acts, msgs)
+  | items :: r ->
+      (let seeds =
+         concatL (map (fun k -> map (fun a -> (fst k, snd k, a)) (lookupS (i, k) [] la))
+                      (kernelOf items)) in
+       let js = clos1 prods nts nul fst1 seeds in
+       match addShifts ts i gt acts msgs with
+         (a1, m1) ->
+           (match addReds prods i js a1 m1 with
+              (a2, m2) -> buildStates prods nts nul fst1 ts gt la r (i+1) a2 m2));
+
+
+(* ================================================================
+   6.5 比較のための SLR(1) 表
+
+   SLR(1) は「還元は FOLLOW 集合の記号すべてで行う」とする簡便法。
+   LALR(1) が状態ごとに文脈を見て先読みを絞るのに対し、SLR(1) は
+   非終端記号ごとの大域的な FOLLOW を使うため、余計な還元が入って
+   衝突が増えることがある。どれだけ違うかを実測できるようにしておく。
+   ================================================================ *)
+
+(* FOLLOW の不動点 *)
+let rec folOne nts nul fst1 lhs syms fol changed =
+  match syms with
+    [] -> (fol, changed)
+  | s :: r ->
+      (if memL s nts then
+         (let add1 = firstSeq nts nul fst1 r in
+          let add2 = (if allNullable nul r then lookupS lhs [] fol else []) in
+          let old = lookupS s [] fol in
+          let nw = unionS add1 (unionS add2 old) in
+          if nw = old then folOne nts nul fst1 lhs r fol changed
+          else folOne nts nul fst1 lhs r (setA s nw fol) true)
+       else folOne nts nul fst1 lhs r fol changed);
+
+let rec folPass nts nul fst1 ps fol changed =
+  match ps with
+    [] -> (fol, changed)
+  | (l, r) :: rest ->
+      (match folOne nts nul fst1 l r fol changed with
+         (f2, ch) -> folPass nts nul fst1 rest f2 ch);
+
+let rec folFix nts nul fst1 prods fol =
+  match folPass nts nul fst1 prods fol false with
+    (f2, ch) -> (if ch then folFix nts nul fst1 prods f2 else f2);
+
+
+(* 1 つの規則を、先読みの集合すべてで還元として入れる *)
+let rec addRedsOn prods i q las acts msgs =
+  match las with
+    [] -> (acts, msgs)
+  | a :: r ->
+      (match addAct i a ("r", q) acts msgs with
+         (ac, ms) -> addRedsOn prods i q r ac ms);
+
+(* SLR(1) の還元を入れる *)
+let rec addRedsSLR prods fol i items acts msgs =
+  match items with
+    [] -> (acts, msgs)
+  | (q, e) :: r ->
+      (if atEnd prods q e then
+         (if q = 0 then
+            (match addAct i "EOF" ("a", 0) acts msgs with
+               (ac, ms) -> addRedsSLR prods fol i r ac ms)
+          else
+            (let las = lookupS (lhsOf prods q) [] fol in
+             match addRedsOn prods i q las acts msgs with
+               (ac, ms) -> addRedsSLR prods fol i r ac ms))
+       else addRedsSLR prods fol i r acts msgs);
+
+let rec buildSLRStates prods ts gt fol states i acts msgs =
+  match states with
+    [] -> (acts, msgs)
+  | items :: r ->
+      (match addShifts ts i gt acts msgs with
+         (a1, m1) ->
+           (match addRedsSLR prods fol i items a1 m1 with
+              (a2, m2) -> buildSLRStates prods ts gt fol r (i+1) a2 m2));
+
+(* ================================================================
+   7. 生成器の入口
+   ================================================================ *)
+
+(* 戻り値 (規則, 終端, 非終端, ACTION 表, GOTO 表, 状態数, 衝突) *)
+let generate spec =
+  let hd = readHead [] [] "" (explode spec) in
+  match hd with
+    (ts0, ns0, start, rest) ->
+      (let ts = app ts0 ["EOF"] in
+       let nts = app ["S'"] ns0 in
+       let prods = app [("S'", [start])] (readProds [] rest) in
+       let nul = nulFix prods [] in
+       let fst1 = fstFix nts nul [] prods in
+       match collection prods nts with
+         (states, gt) ->
+           (let la0 = [((0, (0, 0)), ["EOF"])] in
+            match spreadStates prods nts nul fst1 gt states 0 la0 [] with
+              (la1, prop) ->
+                (let la = propFix prop la1 in
+                 match buildStates prods nts nul fst1 ts gt la states 0 [] [] with
+                   (acts, msgs) ->
+                     (prods, ts, nts, acts, gt, length states, msgs))));
+
+(* 同じ文法から SLR(1) 表を作る。戻り値は (衝突のリスト) *)
+let generateSLR spec =
+  let hd = readHead [] [] "" (explode spec) in
+  match hd with
+    (ts0, ns0, start, rest) ->
+      (let ts = app ts0 ["EOF"] in
+       let nts = app ["S'"] ns0 in
+       let prods = app [("S'", [start])] (readProds [] rest) in
+       let nul = nulFix prods [] in
+       let fst1 = fstFix nts nul [] prods in
+       let fol = folFix nts nul fst1 prods [("S'", ["EOF"])] in
+       match collection prods nts with
+         (states, gt) ->
+           (match buildSLRStates prods ts gt fol states 0 [] [] with
+              (acts, msgs) -> msgs));
+
+(* ================================================================
+   8. LR 駆動部
+   ================================================================ *)
+
+let rec lrRun prods act acts gt stack input =
+  match stack with
+    [] -> ("スタックが空", [])
+  | (st, _) :: _ ->
+      (match input with
+         [] -> ("入力が尽きた", [])
+       | (tk, tv) :: rest ->
+           (let a = lookupS tk ("", 0) (lookupS st [] acts) in
+            if fst a = "s" then lrRun prods act acts gt ((snd a, tv) :: stack) rest
+            else if fst a = "r" then
+              (let p = snd a in
+               let n = length (rhsOf prods p) in
+               let vals = rev (map snd (takeN n stack)) in
+               let st2 = dropN n stack in
+               match st2 with
+                 [] -> ("還元でスタックが空", [])
+               | (s2, _) :: _ ->
+                   (let g = lookupS (s2, lhsOf prods p) (0 - 1) gt in
+                    if g < 0 then ("goto が無い", [])
+                    else lrRun prods act acts gt ((g, act p vals) :: st2) input))
+            else if fst a = "a" then ("ok", snd (nthD (0, []) 0 stack))
+            else ("記号 " ^ tk ^ " で構文誤り（状態 " ^ string_of_int st ^ "）", [])));
+
+let parseWith prods act acts gt toks =
+  lrRun prods act acts gt [(0, [])] (app toks [("EOF", [])]);
+
+(* ================================================================
+   9. 動かす
+   ================================================================ *)
+
+let say s = print_string (s ^ "\n");
+let check s b = say ("  " ^ (if b then "OK  " else "NG  ") ^ s);
+
+(* 前置記法の木を読みやすく戻す *)
+let rec unp t =
+  match t with
+    [] -> ("", [])
+  | (k, nm, n) :: r ->
+      (if k = "num" then (string_of_int n, r)
+       else if k = "var" then (nm, r)
+       else
+         (let p = unp r in
+          let q = unp (snd p) in
+          ("(" ^ fst p ^ " " ^ nm ^ " " ^ fst q ^ ")", snd q)));
+let showT t = fst (unp t);
+
+(* ---- 例1: 電卓の文法 ---- *)
+let calcSpec =
+  "%term NUM | PLUS | TIMES | LP | RP\n" ^
+  "%nonterm exp | term | factor\n" ^
+  "%start exp\n" ^
+  "%%\n" ^
+  "exp    : exp PLUS term | term ;\n" ^
+  "term   : term TIMES factor | factor ;\n" ^
+  "factor : NUM | LP exp RP ;\n";
+
+(* 規則番号ごとの意味動作。規則の並びは
+   0 S'->exp  1 exp->exp PLUS term  2 exp->term
+   3 term->term TIMES factor  4 term->factor
+   5 factor->NUM  6 factor->LP exp RP *)
+let calcAct p vals =
+  if p = 1 then app [("op", "+", 0)] (app (nthD [] 0 vals) (nthD [] 2 vals))
+  else if p = 3 then app [("op", "*", 0)] (app (nthD [] 0 vals) (nthD [] 2 vals))
+  else if p = 6 then nthD [] 1 vals
+  else nthD [] 0 vals;
+
+let tokOf s =
+  if s = "+" then ("PLUS", [])
+  else if s = "*" then ("TIMES", [])
+  else if s = "(" then ("LP", [])
+  else if s = ")" then ("RP", [])
+  else ("NUM", [("num", "", ord s - 48)]);
+
+let demo1 u =
+  match generate calcSpec with
+    (prods, ts, nts, acts, gt, nstates, msgs) ->
+      (let u1 = say ("  規則数 = " ^ string_of_int (length prods)
+                     ^ "  終端 = " ^ string_of_int (length ts)
+                     ^ "  非終端 = " ^ string_of_int (length nts)) in
+       let u2 = say ("  LR(0) 状態数 = " ^ string_of_int nstates) in
+       let u3 = say ("  衝突 = " ^ (if msgs = [] then "なし" else joins " / " msgs)) in
+       let u4 = iter (fun e -> say ("    " ^ string_of_int (fst e) ^ ": " ^ fst (snd e) ^ " -> "
+                                    ^ joins " " (snd (snd e))))
+                     (map (fun i -> (i, nthD ("", []) i prods)) (upto 0 (length prods - 1))) in
+       let run s =
+         (match parseWith prods calcAct acts gt (map tokOf (map (fun c -> c) (explode s))) with
+            (st, v) -> say ("  " ^ s ^ "  ->  " ^ (if st = "ok" then showT v else st))) in
+       iter run ["1+2"; "1+2*3"; "(1+2)*3"; "1+2+3"; "1*2*3"; "1+*2"]);
+
+say "-- 例1: 電卓の文法から LALR(1) 表を作って動かす --";
+demo1 ();
+
+(* ---- 例2: 曖昧な文法。衝突が報告されるか ---- *)
+let ambSpec =
+  "%term NUM | PLUS | TIMES\n" ^
+  "%nonterm exp\n" ^
+  "%start exp\n" ^
+  "%%\n" ^
+  "exp : exp PLUS exp | exp TIMES exp | NUM ;\n";
+
+let demo2 u =
+  match generate ambSpec with
+    (prods, ts, nts, acts, gt, nstates, msgs) ->
+      (let u1 = say ("  LR(0) 状態数 = " ^ string_of_int nstates) in
+       let u2 = say ("  衝突の件数 = " ^ string_of_int (length msgs)) in
+       iter (fun m -> say ("    " ^ m)) msgs);
+
+say "-- 例2: 曖昧な文法では衝突が報告される --";
+demo2 ();
+
+(* ---- 例3: 空生成規則を含む文法 ---- *)
+let epsSpec =
+  "%term A | B\n" ^
+  "%nonterm s | as\n" ^
+  "%start s\n" ^
+  "%%\n" ^
+  "s  : as B ;\n" ^
+  "as : as A | ;\n";
+
+let epsAct p vals = concatL vals;
+
+let demo3 u =
+  match generate epsSpec with
+    (prods, ts, nts, acts, gt, nstates, msgs) ->
+      (let u1 = say ("  LR(0) 状態数 = " ^ string_of_int nstates
+                     ^ "  衝突 = " ^ (if msgs = [] then "なし" else joins " / " msgs)) in
+       let run l =
+         (match parseWith prods epsAct acts gt (map (fun s -> (s, [])) l) with
+            (st, v) -> say ("  " ^ joins " " l ^ "  ->  " ^ st)) in
+       iter run [["B"]; ["A"; "B"]; ["A"; "A"; "B"]; ["A"; "A"]]);
+
+say "-- 例3: 空生成規則を含む文法 --";
+demo3 ();
+
+(* ================================================================
+   10. 本物の文法 -- miniml.grm と同じ規則を与える
+
+   ML-Yacc は %left / %right を使わず、優先順位を非終端記号の層で
+   表している。同じ書き方をそのまま移せる。
+   ================================================================ *)
+
+let mlSpec =
+  "%term NUM | STRING | ID | LET | REC | IN | IF | THEN | ELSE\n" ^
+  "%term FUN | FUNCTION | MATCH | WITH | TRUE | FALSE\n" ^
+  "%term PLUS | MINUS | TIMES | DIVIDE | MOD\n" ^
+  "%term EQ | NE | LT | GT | LE | GE | CARET | ANDALSO | ORELSE\n" ^
+  "%term ARROW | CONS | COMMA | BAR | UNDERSCORE\n" ^
+  "%term LPAREN | RPAREN | LBRACKET | RBRACKET | SEMI\n" ^
+  "%nonterm phrase | definition | letbind | letname | params | cases | caselist\n" ^
+  "%nonterm exp | tupexp | orexp | andexp | cmpexp | consexp | catexp\n" ^
+  "%nonterm addexp | mulexp | appexp | appseq | atexp | elems\n" ^
+  "%nonterm motif | consmotif | atmotif | motiflist\n" ^
+  "%start phrase\n" ^
+  "%%\n" ^
+  "phrase : definition ;\n" ^
+  "definition : LET letbind | exp ;\n" ^
+  "letbind : letname EQ exp ;\n" ^
+  "letname : ID | ID params | REC ID | REC ID params ;\n" ^
+  "params : atmotif | params atmotif ;\n" ^
+  "cases : caselist | BAR caselist ;\n" ^
+  "caselist : motif ARROW exp | caselist BAR motif ARROW exp ;\n" ^
+  "exp : IF exp THEN exp ELSE exp | FUN params ARROW exp | FUNCTION cases\n" ^
+  "    | MATCH exp WITH cases | LET letbind IN exp | tupexp ;\n" ^
+  "tupexp : orexp COMMA tupexp | orexp ;\n" ^
+  "orexp : orexp ORELSE andexp | andexp ;\n" ^
+  "andexp : andexp ANDALSO cmpexp | cmpexp ;\n" ^
+  "cmpexp : cmpexp EQ consexp | cmpexp NE consexp | cmpexp LT consexp\n" ^
+  "       | cmpexp GT consexp | cmpexp LE consexp | cmpexp GE consexp | consexp ;\n" ^
+  "consexp : catexp CONS consexp | catexp ;\n" ^
+  "catexp : addexp CARET catexp | addexp ;\n" ^
+  "addexp : addexp PLUS mulexp | addexp MINUS mulexp | mulexp ;\n" ^
+  "mulexp : mulexp TIMES appexp | mulexp DIVIDE appexp | mulexp MOD appexp | appexp ;\n" ^
+  "appexp : MINUS appexp | appseq ;\n" ^
+  "appseq : appseq atexp | atexp ;\n" ^
+  "atexp : NUM | STRING | ID | TRUE | FALSE | LPAREN RPAREN | LPAREN exp RPAREN\n" ^
+  "      | LBRACKET RBRACKET | LBRACKET elems RBRACKET ;\n" ^
+  "elems : exp | exp SEMI | exp SEMI elems ;\n" ^
+  "motif : consmotif COMMA motif | consmotif ;\n" ^
+  "consmotif : atmotif CONS consmotif | atmotif ;\n" ^
+  "atmotif : ID | UNDERSCORE | NUM | MINUS NUM | STRING | TRUE | FALSE\n" ^
+  "        | LPAREN RPAREN | LPAREN motif RPAREN | LBRACKET RBRACKET\n" ^
+  "        | LBRACKET motiflist RBRACKET ;\n" ^
+  "motiflist : motif | motif SEMI | motif SEMI motiflist ;\n";
+
+let demo4 u =
+  match generate mlSpec with
+    (prods, ts, nts, acts, gt, nstates, msgs) ->
+      (let u1 = say ("  規則数 = " ^ string_of_int (length prods)
+                     ^ "  終端 = " ^ string_of_int (length ts)
+                     ^ "  非終端 = " ^ string_of_int (length nts)) in
+       let u2 = say ("  LR(0) 状態数 = " ^ string_of_int nstates) in
+       let u3 = say ("  衝突の件数 = " ^ string_of_int (length msgs)) in
+       let u4 = iter (fun m -> say ("    " ^ m)) msgs in
+       let showP i = say ("    規則 " ^ string_of_int i ^ ": " ^ fst (nthD ("",[]) i prods)
+                          ^ " -> " ^ joins " " (snd (nthD ("",[]) i prods))) in
+       let u5 = say "  衝突に出てくる規則:" in
+       iter showP [11; 12]);
+
+say "-- 例4: miniml.grm と同じ文法から LALR(1) 表を作る --";
+demo4 ();
+
+(* ================================================================
+   11. LALR(1) と SLR(1) の違いを実測する
+
+   関数適用の文法は、SLR(1) では衝突するが LALR(1) では衝突しない
+   典型例である。
+
+     appseq : ID args | atexp ;
+     args   : atexp | args atexp ;
+     atexp  : NUM | ID | LPAREN exp RPAREN ;
+
+   ID を読んだ状態には  appseq -> ID . args  と  atexp -> ID .  が同居する。
+   SLR(1) は FOLLOW(atexp) で還元するが、args -> args atexp のせいで
+   FOLLOW(atexp) は NUM/ID/LPAREN を含む。よって shift と衝突する。
+   LALR(1) は「この文脈の atexp は appseq -> atexp から来たもので、
+   その後ろに atexp は続かない」と見抜くので衝突しない。
+   ================================================================ *)
+
+let appSpec =
+  "%term NUM | ID | PLUS | LPAREN | RPAREN\n" ^
+  "%nonterm exp | appseq | args | atexp\n" ^
+  "%start exp\n" ^
+  "%%\n" ^
+  "exp : exp PLUS appseq | appseq ;\n" ^
+  "appseq : ID args | atexp ;\n" ^
+  "args : atexp | args atexp ;\n" ^
+  "atexp : NUM | ID | LPAREN exp RPAREN ;\n";
+
+let demo5 u =
+  match generate appSpec with
+    (prods, ts, nts, acts, gt, nstates, msgs) ->
+      (let u1 = say ("  LR(0) 状態数 = " ^ string_of_int nstates) in
+       let u2 = say ("  LALR(1) の衝突 = " ^ string_of_int (length msgs) ^ " 件") in
+       let u3 = iter (fun m -> say ("    " ^ m)) msgs in
+       let sm = generateSLR appSpec in
+       let u4 = say ("  SLR(1)  の衝突 = " ^ string_of_int (length sm) ^ " 件") in
+       iter (fun m -> say ("    " ^ m)) sm);
+
+say "-- 例5: 同じ文法で LALR(1) と SLR(1) を比べる --";
+demo5 ();
+
+let demo6 u =
+  let sm = generateSLR mlSpec in
+  say ("  miniml.grm の文法: LALR(1) 衝突 2 件 / SLR(1) 衝突 "
+       ^ string_of_int (length sm) ^ " 件");
+
+say "-- 例6: MiniML の文法でも比べる --";
+demo6 ();

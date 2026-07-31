@@ -1,0 +1,217 @@
+let say s = print_string (s ^ "\n");
+
+let lexSpec =
+  "digit  = [0-9];\n" ^
+  "idfst  = [A-Za-z_];\n" ^
+  "idchar = [A-Za-z0-9_'];\n" ^
+  "%%\n" ^
+  "[ \\t\\n]+  => (SKIP);\n" ^
+  "\"let\"     => (LET);\n" ^
+  "\"rec\"     => (REC);\n" ^
+  "\"in\"      => (IN);\n" ^
+  "\"if\"      => (IF);\n" ^
+  "\"then\"    => (THEN);\n" ^
+  "\"else\"    => (ELSE);\n" ^
+  "\"mod\"     => (MOD);\n" ^
+  "{digit}+  => (NUM);\n" ^
+  "{idfst}{idchar}* => (ID);\n" ^
+  "\"<=\"      => (LE);\n" ^
+  "\">=\"      => (GE);\n" ^
+  "\"<>\"      => (NE);\n" ^
+  "\"&&\"      => (ANDALSO);\n" ^
+  "\"||\"      => (ORELSE);\n" ^
+  "\"+\"       => (PLUS);\n" ^
+  "\"-\"       => (MINUS);\n" ^
+  "\"*\"       => (TIMES);\n" ^
+  "\"/\"       => (DIVIDE);\n" ^
+  "\"=\"       => (EQ);\n" ^
+  "\"<\"       => (LT);\n" ^
+  "\">\"       => (GT);\n" ^
+  "\"(\"       => (LPAREN);\n" ^
+  "\")\"       => (RPAREN);\n" ^
+  "\";\"       => (SEMI);\n";
+
+(* ================================================================
+   B. 文法仕様。優先順位は非終端記号の層で表す（miniml.grm と同じ流儀）
+   ================================================================ *)
+
+let grmSpec =
+  "%term NUM | ID | LET | REC | IN | IF | THEN | ELSE | MOD\n" ^
+  "%term PLUS | MINUS | TIMES | DIVIDE\n" ^
+  "%term EQ | NE | LT | GT | LE | GE | ANDALSO | ORELSE\n" ^
+  "%term LPAREN | RPAREN | SEMI\n" ^
+  "%nonterm phrase | params | exp | orexp | andexp | cmpexp\n" ^
+  "%nonterm addexp | mulexp | appexp | appseq | args | atexp\n" ^
+  "%start phrase\n" ^
+  "%%\n" ^
+  "phrase : LET REC ID params EQ exp | exp ;\n" ^
+  "params : ID | params ID ;\n" ^
+  "exp : IF exp THEN exp ELSE exp | LET ID EQ exp IN exp | orexp ;\n" ^
+  "orexp : orexp ORELSE andexp | andexp ;\n" ^
+  "andexp : andexp ANDALSO cmpexp | cmpexp ;\n" ^
+  "cmpexp : cmpexp EQ addexp | cmpexp NE addexp | cmpexp LT addexp\n" ^
+  "       | cmpexp GT addexp | cmpexp LE addexp | cmpexp GE addexp | addexp ;\n" ^
+  "addexp : addexp PLUS mulexp | addexp MINUS mulexp | mulexp ;\n" ^
+  "mulexp : mulexp TIMES appexp | mulexp DIVIDE appexp | mulexp MOD appexp | appexp ;\n" ^
+  "appexp : MINUS appexp | appseq ;\n" ^
+  "appseq : ID args | atexp ;\n" ^
+  "args : atexp | args atexp ;\n" ^
+  "atexp : NUM | ID | LPAREN exp RPAREN ;\n";
+
+(* ================================================================
+   C. 意味動作。規則番号で分岐する（ML-Yacc の動作部にあたる）
+   ================================================================ *)
+
+let rec countTrees code =
+  match code with [] -> 0 | _ :: _ -> 1 + countTrees (skip1 code);
+
+let headName v = match v with [] -> "" | t :: _ -> namOf t;
+
+let bin g a b = app [(g, "", 0)] (app a b);
+
+let semAct p vals =
+  let v0 = nthD [] 0 vals in
+  let v1 = nthD [] 1 vals in
+  let v2 = nthD [] 2 vals in
+  let v3 = nthD [] 3 vals in
+  let v5 = nthD [] 5 vals in
+  if p = 1 then                          (* phrase -> LET REC ID params EQ exp *)
+    app [("def", headName v2, countTrees v3)] (app v3 v5)
+  else if p = 4 then app v0 v1           (* params -> params ID *)
+  else if p = 5 then                     (* exp -> IF exp THEN exp ELSE exp *)
+    app [("if", "", 0)] (app v1 (app v3 v5))
+  else if p = 6 then                     (* exp -> LET ID EQ exp IN exp *)
+    app [("let", headName v1, 0)] (app v3 v5)
+  else if p = 8  then bin "|" v0 v2
+  else if p = 10 then bin "&" v0 v2
+  else if p = 12 then bin "=" v0 v2
+  else if p = 13 then bin "#" v0 v2
+  else if p = 14 then bin "<" v0 v2
+  else if p = 15 then bin ">" v0 v2
+  else if p = 16 then bin "<=" v0 v2
+  else if p = 17 then bin ">=" v0 v2
+  else if p = 19 then bin "+" v0 v2
+  else if p = 20 then bin "-" v0 v2
+  else if p = 22 then bin "*" v0 v2
+  else if p = 23 then bin "/" v0 v2
+  else if p = 24 then bin "%" v0 v2
+  else if p = 26 then app [("~", "", 0)] v1        (* appexp -> MINUS appexp *)
+  else if p = 28 then                              (* appseq -> ID args *)
+    app [("call", headName v0, countTrees v1)] v1
+  else if p = 31 then app v0 v1                    (* args -> args atexp *)
+  else if p = 34 then v1                           (* atexp -> LPAREN exp RPAREN *)
+  else v0;
+
+(* ================================================================
+   D. 原文から値まで通す
+   ================================================================ *)
+
+let rec toIntFrom s i n acc =
+  if i >= n then acc else toIntFrom s (i+1) n (acc * 10 + (ord (sub s i) - 48));
+let toInt s = toIntFrom s 0 (size s) 0;
+
+let rec toksLoop tbl ac acts src pos n out =
+  if pos >= n then rev out
+  else
+    (match scanOne tbl ac src pos n with
+       (r, np) ->
+         if r < 0 then rev (("ERR", substr src pos (pos+1)) :: out)
+         else
+           (let nm = nthD "" r acts in
+            let text = substr src pos np in
+            let np2 = (if np <= pos then pos + 1 else np) in
+            toksLoop tbl ac acts src np2 n (if nm = "SKIP" then out else (nm, text) :: out)));
+
+let tk2 p =
+  (if fst p = "NUM" then ("NUM", [("n", "", toInt (snd p))])
+   else if fst p = "ID" then ("ID", [("v", snd p, 0)])
+   else (fst p, []));
+
+let rec splitSemi acc cur l =
+  match l with
+    [] -> rev (if cur = [] then acc else rev cur :: acc)
+  | p :: r ->
+      (if fst p = "SEMI" then splitSemi (if cur = [] then acc else rev cur :: acc) [] r
+       else splitSemi acc (p :: cur) r);
+
+(* def 節点から (名前, 仮引数, 本体) を取り出す *)
+let rec takeNames k code acc =
+  if k <= 0 then (rev acc, code)
+  else (match code with
+          [] -> (rev acc, [])
+        | t :: r -> takeNames (k-1) r (namOf t :: acc));
+
+(* 1 フレーズを処理する。定義なら defs に足し、式なら評価して表示する *)
+let doPhrase prods acts gt defs toks =
+  match parseWith prods semAct acts gt toks with
+    (st, v) ->
+      (if not (st = "ok") then (let u = say ("  構文誤り: " ^ st) in defs)
+       else
+         match v with
+           [] -> defs
+         | t :: r ->
+             (if tagOf t = "def" then
+                (match takeNames (numOf t) r [] with
+                   (ps, body) ->
+                     (let u = say ("  定義 " ^ namOf t ^ " " ^ joins " " ps
+                                   ^ " = " ^ unparse body) in
+                      app defs [(namOf t, (ps, body))]))
+              else
+                (let u = say ("  " ^ unparse v ^ "  =>  " ^ string_of_int (run defs v)) in
+                 defs)));
+
+let rec runPhrases prods acts gt defs ps =
+  match ps with
+    [] -> defs
+  | t :: r -> runPhrases prods acts gt (doPhrase prods acts gt defs t) r;
+
+(* ================================================================
+   E. 動かす
+   ================================================================ *)
+
+let src1 =
+  "let rec fac n = if n = 0 then 1 else n * fac (n - 1);\n" ^
+  "let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2);\n" ^
+  "let rec gcd a b = if b = 0 then a else gcd b (a mod b);\n" ^
+  "let rec pow b k = if k = 0 then 1 else b * pow b (k - 1);\n" ^
+  "fac 10;\n" ^
+  "fib 20;\n" ^
+  "gcd 1071 462;\n" ^
+  "pow 2 30;\n" ^
+  "let x = 3 in x * x + 1;\n" ^
+  "1 + 2 * 3;\n" ^
+  "(1 + 2) * 3;\n" ^
+  "1 + 2 + 3 - 4;\n" ^
+  "-5 + 8;\n" ^
+  "17 mod 5;\n" ^
+  "1 < 2 && 3 >= 3;\n" ^
+  "fac 5 + fib 10;\n";
+
+let go u =
+  (* 字句解析器を生成する *)
+  let lh = readHead [] [] (explode lexSpec) in
+  let lrules = readRules (fst (snd lh)) [] (snd (snd lh)) in
+  let lpairs = map (fun x -> (fst (snd x), snd (snd x))) lrules in
+  match makeDFA lpairs with
+    (ltbl, lacc, ln) ->
+      (let lacts = map snd lpairs in
+       let u1 = say ("  字句: 規則 " ^ string_of_int (length lpairs)
+                     ^ " 本 -> DFA 状態 " ^ string_of_int ln) in
+       (* 構文解析器を生成する *)
+       match generate grmSpec with
+         (prods, ts, nts, acts, gt, nstates, msgs) ->
+           (let u2 = say ("  構文: 規則 " ^ string_of_int (length prods)
+                          ^ " 本 -> LR(0) 状態 " ^ string_of_int nstates) in
+            let u3 = say ("  衝突: " ^ (if msgs = [] then "なし"
+                                        else string_of_int (length msgs) ^ " 件")) in
+            let u4 = iter (fun m -> say ("    " ^ m)) msgs in
+            let u5 = say "  -- 生成した 2 つの表で MiniML を動かす --" in
+            let tokens = map tk2 (toksLoop ltbl lacc lacts src1 0 (size src1) []) in
+            let u6 = say ("  記号の総数 = " ^ string_of_int (length tokens)) in
+            let phrases = splitSemi [] [] tokens in
+            let u7 = say ("  フレーズ数 = " ^ string_of_int (length phrases)) in
+            let d = runPhrases prods acts gt [] phrases in
+            say ("  定義された関数 = " ^ string_of_int (length d) ^ " 個")));
+
+say "-- 自作の生成器 2 つで作った MiniML --";
+go ();
